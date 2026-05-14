@@ -15,6 +15,8 @@ import time
 import os
 import json
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -164,8 +166,27 @@ def safe_val(v: Any, default: float = 0.0) -> float:
         return default
 
 
+def _make_yf_session() -> requests.Session:
+    """Create a browser-like session so Yahoo Finance doesn't block datacenter IPs."""
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
+    })
+    retry = Retry(total=3, backoff_factor=1.5, status_forcelist=[429, 500, 502, 503, 504])
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
+
+_YF_SESSION = _make_yf_session()
+
+
 def get_ticker(symbol: str) -> yf.Ticker:
-    return yf.Ticker(symbol + ".NS")
+    return yf.Ticker(symbol + ".NS", session=_YF_SESSION)
 
 
 def fy_label(dt: Any) -> str:
