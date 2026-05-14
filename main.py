@@ -170,36 +170,87 @@ def safe_val(v: Any, default: float = 0.0) -> float:
         return default
 
 
-def _make_yf_session():
-    """
-    Use curl_cffi to impersonate Chrome's TLS fingerprint.
-    Yahoo Finance checks the TLS fingerprint (JA3), not just headers.
-    curl_cffi spoofs the exact Chrome cipher suites so the request
-    looks indistinguishable from a real browser.
-    Falls back to plain requests if curl_cffi isn't installed.
-    """
-    if _CURL_AVAILABLE:
-        print("[ROBU] Using curl_cffi Chrome impersonation session")
-        return cffi_requests.Session(impersonate="chrome120")
-    # fallback
-    print("[ROBU] curl_cffi not available, using plain requests session")
-    session = requests.Session()
-    session.headers.update({
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    })
-    return session
-
-_YF_SESSION = _make_yf_session()
-
-
-def get_ticker(symbol: str) -> yf.Ticker:
-    return yf.Ticker(symbol + ".NS", session=_YF_SESSION)
-
-
 def fy_label(dt: Any) -> str:
     if hasattr(dt, "year"):
         return f"FY{str(dt.year)[2:]}"
     return str(dt)
+
+
+# ---------------------------------------------------------------------------
+# Yahoo Finance direct API (bypasses yfinance, uses curl_cffi Chrome spoof)
+# ---------------------------------------------------------------------------
+_YF_SESSION_OBJ: Any = None
+_YF_CRUMB: str = ""
+_YF_SESSION_TS: float = 0
+_YF_HOST = "https://query1.finance.yahoo.com"
+
+
+def _init_yahoo():
+    """Get crumb + cookies from Yahoo Finance using Chrome TLS impersonation."""
+    global _YF_SESSION_OBJ, _YF_CRUMB, _YF_SESSION_TS
+    if not _CURL_AVAILABLE:
+        print("[ROBU] curl_cffi unavailable — Yahoo Finance direct API disabled")
+        return
+    try:
+        sess = cffi_requests.Session(impersonate="chrome120")
+        sess.get("https://finance.yahoo.com", timeout=15)
+        time.sleep(0.5)
+        r = sess.get(f"{_YF_HOST}/v1/test/getcrumb", timeout=10)
+        if r.status_code == 200 and r.text.strip():
+            _YF_SESSION_OBJ = sess
+            _YF_CRUMB = r.text.strip()
+            _YF_SESSION_TS = time.time()
+            print(f"[ROBU] Yahoo Finance session ready (crumb obtained)")
+        else:
+            print(f"[ROBU] Crumb fetch returned {r.status_code}: {r.text[:80]}")
+    except Exception as e:
+        print(f"[ROBU] Yahoo init error: {e}")
+
+
+def _ensure_yahoo():
+    """Re-init session if stale (>25 min)."""
+    if not _YF_SESSION_OBJ or not _YF_CRUMB or time.time() - _YF_SESSION_TS > 1500:
+        _init_yahoo()
+
+
+def _yf_summary(symbol_ns: str, modules: str) -> dict:
+    """Call Yahoo Finance quoteSummary directly."""
+    _ensure_yahoo()
+    if not _YF_SESSION_OBJ or not _YF_CRUMB:
+        raise HTTPException(503, "Yahoo Finance session unavailable on this server")
+
+    params = {"modules": modules, "crumb": _YF_CRUMB, "formatted": "false", "lang": "en-US"}
+    resp = _YF_SESSION_OBJ.get(
+        f"{_YF_HOST}/v10/finance/quoteSummary/{symbol_ns}", params=params, timeout=20
+    )
+
+    # If session expired, refresh once and retry
+    if resp.status_code in (401, 403):
+        global _YF_SESSION_TS
+        _YF_SESSION_TS = 0
+        _init_yahoo()
+        if not _YF_SESSION_OBJ or not _YF_CRUMB:
+            raise HTTPException(503, "Yahoo Finance session refresh failed")
+        params["crumb"] = _YF_CRUMB
+        resp = _YF_SESSION_OBJ.get(
+            f"{_YF_HOST}/v10/finance/quoteSummary/{symbol_ns}", params=params, timeout=20
+        )
+
+    if not resp.ok:
+        raise HTTPException(resp.status_code, f"Yahoo Finance error for {symbol_ns}: HTTP {resp.status_code}")
+
+    data = resp.json()
+    err = (data.get("quoteSummary") or {}).get("error")
+    if err:
+        raise HTTPException(404, err.get("description", "Not found"))
+    results = (data.get("quoteSummary") or {}).get("result") or []
+    if not results:
+        raise HTTPException(404, f"No data for {symbol_ns}")
+    return results[0]
+
+
+# Initialise Yahoo session at startup
+_init_yahoo()
 
 
 # ---------------------------------------------------------------------------
@@ -245,60 +296,72 @@ def search(q: str = ""):
 
 @app.get("/company/{symbol}")
 def company(symbol: str):
-    """Return key company metrics from yfinance for any NSE stock."""
+    """Return key company metrics — direct Yahoo Finance API via curl_cffi."""
     symbol = symbol.upper().strip()
     cache_key = f"company:{symbol}"
     cached = _cache_get(cache_key)
     if cached is not None:
         return cached
 
-    try:
-        ticker = get_ticker(symbol)
-        time.sleep(0.5)
-        info = ticker.info
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"yfinance error for {symbol}: {str(e)}")
+    ns = symbol + ".NS"
+    modules = "financialData,defaultKeyStatistics,assetProfile,summaryDetail,price"
+    data = _yf_summary(ns, modules)
 
-    price = safe_val(info.get("currentPrice") or info.get("regularMarketPrice"))
-    if price == 0:
-        raise HTTPException(status_code=404, detail=f"No price data for {symbol}.NS — check symbol is correct.")
+    fd  = data.get("financialData", {})
+    ks  = data.get("defaultKeyStatistics", {})
+    ap  = data.get("assetProfile", {})
+    sd  = data.get("summaryDetail", {})
+    pr  = data.get("price", {})
 
-    prev_close = safe_val(info.get("previousClose") or info.get("regularMarketPreviousClose"))
-    change = round(price - prev_close, 2) if prev_close else 0.0
+    def rv(d: dict, key: str) -> Any:
+        v = d.get(key)
+        if isinstance(v, dict):
+            return v.get("raw")
+        return v
+
+    price_val = safe_val(rv(pr, "regularMarketPrice") or rv(fd, "currentPrice"))
+    if price_val == 0:
+        raise HTTPException(404, f"No price data for {ns}")
+
+    prev_close = safe_val(rv(pr, "regularMarketPreviousClose") or rv(sd, "previousClose"))
+    change = round(price_val - prev_close, 2) if prev_close else 0.0
     change_pct = round((change / prev_close) * 100, 2) if prev_close else 0.0
-
-    mktcap_cr = round(safe_val(info.get("marketCap")) / 1e7, 2)
-    shares_cr = round(safe_val(info.get("sharesOutstanding")) / 1e7, 2)
+    mktcap_cr = round(safe_val(rv(pr, "marketCap") or rv(sd, "marketCap")) / 1e7, 2)
+    shares_cr = round(safe_val(rv(ks, "sharesOutstanding")) / 1e7, 2)
 
     stock_meta = STOCK_UNIVERSE.get(symbol, {})
+    roe_raw = rv(fd, "returnOnEquity")
+    roa_raw = rv(fd, "returnOnAssets")
+    div_raw = rv(sd, "dividendYield")
+    rev_g   = rv(fd, "revenueGrowth")
+    ear_g   = rv(fd, "earningsGrowth")
+    d2e     = rv(fd, "debtToEquity")
 
     result = {
         "symbol": symbol,
-        "name": info.get("longName") or info.get("shortName") or stock_meta.get("name", symbol),
-        "sector": info.get("sector") or stock_meta.get("sector", "Unknown"),
-        "industry": info.get("industry", ""),
-        "currentPrice": price,
+        "name": rv(pr, "longName") or rv(pr, "shortName") or stock_meta.get("name", symbol),
+        "sector": ap.get("sector") or stock_meta.get("sector", "Unknown"),
+        "industry": ap.get("industry", ""),
+        "currentPrice": price_val,
         "previousClose": prev_close,
         "change": change,
         "changePct": change_pct,
         "marketCap": mktcap_cr,
-        "pe": safe_val(info.get("trailingPE")),
-        "forwardPE": safe_val(info.get("forwardPE")),
-        "pb": safe_val(info.get("priceToBook")),
-        "roe": round(safe_val(info.get("returnOnEquity")) * 100, 2) if info.get("returnOnEquity") else 0.0,
-        "roa": round(safe_val(info.get("returnOnAssets")) * 100, 2) if info.get("returnOnAssets") else 0.0,
-        "eps": safe_val(info.get("trailingEps")),
-        "dividendYield": round(safe_val(info.get("dividendYield")) * 100, 2) if info.get("dividendYield") else 0.0,
-        "week52High": safe_val(info.get("fiftyTwoWeekHigh")),
-        "week52Low": safe_val(info.get("fiftyTwoWeekLow")),
-        # yfinance returns debtToEquity as percentage (e.g. 10.5 = 10.5% = 0.105x ratio)
-        # Divide by 100 to get the actual ratio displayed to users
-        "debtToEquity": round(safe_val(info.get("debtToEquity")) / 100, 2),
-        "currentRatio": safe_val(info.get("currentRatio")),
+        "pe": safe_val(rv(sd, "trailingPE")),
+        "forwardPE": safe_val(rv(sd, "forwardPE")),
+        "pb": safe_val(rv(ks, "priceToBook")),
+        "roe": round(float(roe_raw) * 100, 2) if roe_raw else 0.0,
+        "roa": round(float(roa_raw) * 100, 2) if roa_raw else 0.0,
+        "eps": safe_val(rv(ks, "trailingEps")),
+        "dividendYield": round(float(div_raw) * 100, 2) if div_raw else 0.0,
+        "week52High": safe_val(rv(sd, "fiftyTwoWeekHigh")),
+        "week52Low": safe_val(rv(sd, "fiftyTwoWeekLow")),
+        "debtToEquity": round(safe_val(d2e) / 100, 2) if d2e else 0.0,
+        "currentRatio": safe_val(rv(fd, "currentRatio")),
         "shares": shares_cr,
-        "beta": safe_val(info.get("beta")),
-        "revenueGrowth": round(safe_val(info.get("revenueGrowth")) * 100, 2) if info.get("revenueGrowth") else 0.0,
-        "earningsGrowth": round(safe_val(info.get("earningsGrowth")) * 100, 2) if info.get("earningsGrowth") else 0.0,
+        "beta": safe_val(rv(ks, "beta")),
+        "revenueGrowth": round(float(rev_g) * 100, 2) if rev_g else 0.0,
+        "earningsGrowth": round(float(ear_g) * 100, 2) if ear_g else 0.0,
     }
 
     _cache_set(cache_key, result)
@@ -307,70 +370,64 @@ def company(symbol: str):
 
 @app.get("/financials/{symbol}")
 def financials(symbol: str):
-    """Return last 5 years of annual financials for any NSE stock."""
+    """Return last 5 years of annual financials — direct Yahoo Finance API."""
     symbol = symbol.upper().strip()
     cache_key = f"financials:{symbol}"
     cached = _cache_get(cache_key)
     if cached is not None:
         return cached
 
-    try:
-        ticker = get_ticker(symbol)
-        time.sleep(0.5)
-        fin = ticker.financials
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"yfinance financials error for {symbol}: {str(e)}")
+    ns = symbol + ".NS"
+    data = _yf_summary(ns, "incomeStatementHistory,defaultKeyStatistics")
+    stmts = (data.get("incomeStatementHistory") or {}).get("incomeStatementHistory") or []
 
-    if fin is None or fin.empty:
-        raise HTTPException(status_code=404, detail=f"No financials for {symbol}.NS")
+    if not stmts:
+        raise HTTPException(404, f"No financials for {ns}")
 
-    fin = fin[sorted(fin.columns)]
-    cols = list(fin.columns)[-5:]
-    fin = fin[cols]
+    stmts = sorted(stmts, key=lambda x: x.get("endDate", {}).get("raw", 0))[-5:]
+
+    def rv(d: dict, key: str) -> float:
+        v = d.get(key)
+        if isinstance(v, dict):
+            return safe_val(v.get("raw"))
+        return safe_val(v)
 
     rows = []
     prev_revenue = None
 
-    for col in cols:
-        def g(key: str) -> float:
-            if key in fin.index:
-                return safe_val(fin.loc[key, col])
-            return 0.0
+    for stmt in stmts:
+        end_ts = (stmt.get("endDate") or {}).get("raw", 0)
+        year_label = f"FY{datetime.utcfromtimestamp(end_ts).strftime('%y')}" if end_ts else "?"
 
-        revenue = g("Total Revenue")
-        pat = g("Net Income")
-        ebitda = g("EBITDA")
+        revenue = rv(stmt, "totalRevenue")
+        pat     = rv(stmt, "netIncome")
+        ebitda  = rv(stmt, "ebitda")
+        gross   = rv(stmt, "grossProfit")
+        op_inc  = rv(stmt, "operatingIncome")
+        da      = rv(stmt, "depreciationAndAmortization")
+        eps_val = rv(stmt, "basicEps") or rv(stmt, "dilutedEps")
 
-        if ebitda == 0.0:
-            op_income = g("Operating Income")
-            da = g("Reconciled Depreciation") or g("Depreciation And Amortization In Income Statement")
-            gross = g("Gross Profit")
-            if op_income and da:
-                ebitda = op_income + da
-            elif gross:
-                sga = g("Selling General And Administration")
-                ebitda = gross - sga if sga else gross
+        if ebitda == 0 and op_inc and da:
+            ebitda = op_inc + da
+        elif ebitda == 0 and gross:
+            ebitda = gross
 
-        eps_val = g("Basic EPS") or g("Diluted EPS")
-
-        revenue_cr = round(revenue / 1e7, 2) if revenue else 0.0
-        pat_cr = round(pat / 1e7, 2) if pat else 0.0
-        ebitda_cr = round(ebitda / 1e7, 2) if ebitda else 0.0
-
-        net_margin = round((pat / revenue) * 100, 2) if revenue else 0.0
-        ebitda_margin = round((ebitda / revenue) * 100, 2) if revenue and ebitda else 0.0
-
-        rev_growth = 0.0
+        revenue_cr   = round(revenue / 1e7, 2) if revenue else 0.0
+        pat_cr       = round(pat / 1e7, 2) if pat else 0.0
+        ebitda_cr    = round(ebitda / 1e7, 2) if ebitda else 0.0
+        net_margin   = round((pat / revenue) * 100, 2) if revenue else 0.0
+        ebitda_margin= round((ebitda / revenue) * 100, 2) if revenue and ebitda else 0.0
+        rev_growth   = 0.0
         if prev_revenue and prev_revenue > 0 and revenue:
             rev_growth = round(((revenue - prev_revenue) / prev_revenue) * 100, 2)
         prev_revenue = revenue
 
         rows.append({
-            "year": fy_label(col),
+            "year": year_label,
             "revenue": revenue_cr,
             "pat": pat_cr,
             "ebitda": ebitda_cr,
-            "eps": round(float(eps_val), 2) if eps_val else 0.0,
+            "eps": round(eps_val, 2) if eps_val else 0.0,
             "netMargin": net_margin,
             "revenueGrowth": rev_growth,
             "ebitdaMargin": ebitda_margin,
@@ -382,22 +439,23 @@ def financials(symbol: str):
 
 @app.get("/price/{symbol}")
 def price(symbol: str):
-    """Quick current price endpoint."""
+    """Quick current price endpoint — direct Yahoo Finance API."""
     symbol = symbol.upper().strip()
     cache_key = f"price:{symbol}"
     cached = _cache_get(cache_key)
     if cached is not None:
         return cached
 
-    try:
-        ticker = get_ticker(symbol)
-        time.sleep(0.3)
-        info = ticker.info
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    ns = symbol + ".NS"
+    data = _yf_summary(ns, "price")
+    pr = data.get("price", {})
 
-    current_price = safe_val(info.get("currentPrice") or info.get("regularMarketPrice"))
-    prev_close = safe_val(info.get("previousClose") or info.get("regularMarketPreviousClose"))
+    def rv(d: dict, key: str) -> Any:
+        v = d.get(key)
+        return v.get("raw") if isinstance(v, dict) else v
+
+    current_price = safe_val(rv(pr, "regularMarketPrice"))
+    prev_close = safe_val(rv(pr, "regularMarketPreviousClose"))
     change = round(current_price - prev_close, 2) if current_price and prev_close else 0.0
     change_pct = round((change / prev_close) * 100, 2) if prev_close else 0.0
 
