@@ -399,13 +399,19 @@ def financials(symbol: str):
         end_ts = (stmt.get("endDate") or {}).get("raw", 0)
         year_label = f"FY{datetime.utcfromtimestamp(end_ts).strftime('%y')}" if end_ts else "?"
 
-        revenue = rv(stmt, "totalRevenue")
+        # totalRevenue is 0 for banks — fall back to totalInterestIncome or netInterestIncome
+        revenue = (rv(stmt, "totalRevenue")
+                   or rv(stmt, "totalInterestIncome")
+                   or rv(stmt, "netInterestIncome")
+                   or rv(stmt, "totalIncome"))
         pat     = rv(stmt, "netIncome")
         ebitda  = rv(stmt, "ebitda")
         gross   = rv(stmt, "grossProfit")
         op_inc  = rv(stmt, "operatingIncome")
         da      = rv(stmt, "depreciationAndAmortization")
-        eps_val = rv(stmt, "basicEps") or rv(stmt, "dilutedEps")
+        # Yahoo Finance uses basicEPS (capital S) — try both cases
+        eps_val = (rv(stmt, "basicEPS") or rv(stmt, "dilutedEPS")
+                   or rv(stmt, "basicEps") or rv(stmt, "dilutedEps"))
 
         if ebitda == 0 and op_inc and da:
             ebitda = op_inc + da
