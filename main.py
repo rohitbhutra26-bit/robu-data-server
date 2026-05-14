@@ -378,7 +378,8 @@ def financials(symbol: str):
         return cached
 
     ns = symbol + ".NS"
-    data = _yf_summary(ns, "incomeStatementHistory,defaultKeyStatistics")
+    # financialData gives TTM figures — used to fill FY gap when annual stmts lag
+    data = _yf_summary(ns, "incomeStatementHistory,defaultKeyStatistics,financialData")
     stmts = (data.get("incomeStatementHistory") or {}).get("incomeStatementHistory") or []
 
     if not stmts:
@@ -388,6 +389,7 @@ def financials(symbol: str):
 
     # Shares outstanding — used to calculate EPS when Yahoo doesn't provide it directly
     ks = data.get("defaultKeyStatistics") or {}
+    fd = data.get("financialData") or {}
     so_raw = ks.get("sharesOutstanding")
     shares_outstanding = float(so_raw.get("raw", 0) if isinstance(so_raw, dict) else (so_raw or 0))
     # trailingEps from key stats — most reliable EPS figure for the latest year
@@ -456,6 +458,51 @@ def financials(symbol: str):
             "revenueGrowth": rev_growth,
             "ebitdaMargin": ebitda_margin,
         })
+
+    # ------------------------------------------------------------------
+    # Inject TTM row if annual stmts lag behind current Indian FY
+    # Indian FY ends March 31. Yahoo often only has last-filed annual,
+    # which can be 1-2 years old. financialData.totalRevenue = TTM.
+    # ------------------------------------------------------------------
+    today_dt = datetime.utcnow()
+    # Indian FY year = calendar year of March 31 end
+    # e.g. May 2026 → current FY = 2026 (April 2025–March 2026)
+    current_fy = today_dt.year if today_dt.month >= 4 else today_dt.year - 1
+
+    last_stmt_ts = (stmts[-1].get("endDate") or {}).get("raw", 0) if stmts else 0
+    last_stmt_year = datetime.utcfromtimestamp(last_stmt_ts).year if last_stmt_ts else 0
+
+    if last_stmt_year < current_fy and fd:
+        ttm_revenue = safe_val(fd.get("totalRevenue", {}).get("raw") if isinstance(fd.get("totalRevenue"), dict) else fd.get("totalRevenue"))
+        ttm_ebitda  = safe_val(fd.get("ebitda", {}).get("raw") if isinstance(fd.get("ebitda"), dict) else fd.get("ebitda"))
+        ttm_pat_raw = fd.get("netIncomeToCommon") or fd.get("netIncome")
+        ttm_pat     = safe_val(ttm_pat_raw.get("raw") if isinstance(ttm_pat_raw, dict) else ttm_pat_raw)
+        # Fallback: derive PAT from trailingEps × shares
+        if not ttm_pat and trailing_eps and shares_outstanding:
+            ttm_pat = trailing_eps * shares_outstanding
+
+        if ttm_revenue:
+            ttm_label      = f"FY{str(current_fy)[2:]}"
+            ttm_revenue_cr = round(ttm_revenue / 1e7, 2)
+            ttm_pat_cr     = round(ttm_pat / 1e7, 2) if ttm_pat else 0.0
+            ttm_ebitda_cr  = round(ttm_ebitda / 1e7, 2) if ttm_ebitda else 0.0
+            ttm_net_margin = round((ttm_pat / ttm_revenue) * 100, 2) if ttm_pat and ttm_revenue else 0.0
+            ttm_ebitda_margin = round((ttm_ebitda / ttm_revenue) * 100, 2) if ttm_ebitda and ttm_revenue else 0.0
+            ttm_rev_growth = 0.0
+            if prev_revenue and prev_revenue > 0 and ttm_revenue:
+                ttm_rev_growth = round(((ttm_revenue - prev_revenue) / prev_revenue) * 100, 2)
+
+            rows.append({
+                "year": ttm_label,
+                "revenue": ttm_revenue_cr,
+                "pat": ttm_pat_cr,
+                "ebitda": ttm_ebitda_cr,
+                "eps": round(trailing_eps, 2) if trailing_eps else 0.0,
+                "netMargin": ttm_net_margin,
+                "revenueGrowth": ttm_rev_growth,
+                "ebitdaMargin": ttm_ebitda_margin,
+            })
+            rows = rows[-5:]  # keep only 5 years
 
     _cache_set(cache_key, rows)
     return rows
