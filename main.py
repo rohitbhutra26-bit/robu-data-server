@@ -386,6 +386,14 @@ def financials(symbol: str):
 
     stmts = sorted(stmts, key=lambda x: x.get("endDate", {}).get("raw", 0))[-5:]
 
+    # Shares outstanding — used to calculate EPS when Yahoo doesn't provide it directly
+    ks = data.get("defaultKeyStatistics") or {}
+    so_raw = ks.get("sharesOutstanding")
+    shares_outstanding = float(so_raw.get("raw", 0) if isinstance(so_raw, dict) else (so_raw or 0))
+    # trailingEps from key stats — most reliable EPS figure for the latest year
+    teps_raw = ks.get("trailingEps")
+    trailing_eps = float(teps_raw.get("raw", 0) if isinstance(teps_raw, dict) else (teps_raw or 0))
+
     def rv(d: dict, key: str) -> float:
         v = d.get(key)
         if isinstance(v, dict):
@@ -395,11 +403,11 @@ def financials(symbol: str):
     rows = []
     prev_revenue = None
 
-    for stmt in stmts:
+    for i, stmt in enumerate(stmts):
         end_ts = (stmt.get("endDate") or {}).get("raw", 0)
         year_label = f"FY{datetime.utcfromtimestamp(end_ts).strftime('%y')}" if end_ts else "?"
 
-        # totalRevenue is 0 for banks — fall back to totalInterestIncome or netInterestIncome
+        # totalRevenue is 0 for banks — fall back to interest income
         revenue = (rv(stmt, "totalRevenue")
                    or rv(stmt, "totalInterestIncome")
                    or rv(stmt, "netInterestIncome")
@@ -409,9 +417,19 @@ def financials(symbol: str):
         gross   = rv(stmt, "grossProfit")
         op_inc  = rv(stmt, "operatingIncome")
         da      = rv(stmt, "depreciationAndAmortization")
-        # Yahoo Finance uses basicEPS (capital S) — try both cases
+
+        # Try direct EPS fields (Yahoo Finance is inconsistent with casing)
         eps_val = (rv(stmt, "basicEPS") or rv(stmt, "dilutedEPS")
                    or rv(stmt, "basicEps") or rv(stmt, "dilutedEps"))
+
+        # Fallback: calculate EPS from PAT ÷ shares outstanding
+        # PAT from stmt is in absolute rupees; shares_outstanding is also absolute
+        if not eps_val and pat and shares_outstanding > 0:
+            eps_val = pat / shares_outstanding
+
+        # For the most recent year, prefer trailingEps which is most accurate
+        if i == len(stmts) - 1 and trailing_eps > 0:
+            eps_val = trailing_eps
 
         if ebitda == 0 and op_inc and da:
             ebitda = op_inc + da
