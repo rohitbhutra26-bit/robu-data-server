@@ -149,12 +149,18 @@ def _load_bse_universe():
         if info.get("isin")
     }
     try:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            "Referer": "https://www.bseindia.com/",
-            "Accept": "application/json, */*",
-        }
-        resp = requests.get(_BSE_LIST_URL, headers=headers, timeout=30)
+        if _CURL_AVAILABLE:
+            _bse_sess = cffi_requests.Session(impersonate="chrome120")
+            _bse_sess.get("https://www.bseindia.com", timeout=15)
+            time.sleep(0.5)
+            resp = _bse_sess.get(_BSE_LIST_URL, headers={"Accept": "application/json"}, timeout=30)
+        else:
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                "Referer": "https://www.bseindia.com/",
+                "Accept": "application/json, */*",
+            }
+            resp = requests.get(_BSE_LIST_URL, headers=headers, timeout=30)
         if not resp.ok:
             print(f"[ROBU] BSE list HTTP {resp.status_code} — skipping BSE universe")
             return
@@ -254,25 +260,35 @@ _YF_HOST = "https://query1.finance.yahoo.com"
 
 
 def _init_yahoo():
-    """Get crumb + cookies from Yahoo Finance using Chrome TLS impersonation."""
+    """Get crumb + cookies from Yahoo Finance using Chrome TLS impersonation.
+    Retries up to 5 times with backoff if rate-limited (429)."""
     global _YF_SESSION_OBJ, _YF_CRUMB, _YF_SESSION_TS
     if not _CURL_AVAILABLE:
         print("[ROBU] curl_cffi unavailable — Yahoo Finance direct API disabled")
         return
-    try:
-        sess = cffi_requests.Session(impersonate="chrome120")
-        sess.get("https://finance.yahoo.com", timeout=15)
-        time.sleep(0.5)
-        r = sess.get(f"{_YF_HOST}/v1/test/getcrumb", timeout=10)
-        if r.status_code == 200 and r.text.strip():
-            _YF_SESSION_OBJ = sess
-            _YF_CRUMB = r.text.strip()
-            _YF_SESSION_TS = time.time()
-            print(f"[ROBU] Yahoo Finance session ready (crumb obtained)")
-        else:
-            print(f"[ROBU] Crumb fetch returned {r.status_code}: {r.text[:80]}")
-    except Exception as e:
-        print(f"[ROBU] Yahoo init error: {e}")
+    delays = [2, 5, 15, 30, 60]  # seconds between retries
+    for attempt, delay in enumerate(delays, 1):
+        try:
+            sess = cffi_requests.Session(impersonate="chrome120")
+            sess.get("https://finance.yahoo.com", timeout=15)
+            time.sleep(1)
+            r = sess.get(f"{_YF_HOST}/v1/test/getcrumb", timeout=10)
+            if r.status_code == 200 and r.text.strip():
+                _YF_SESSION_OBJ = sess
+                _YF_CRUMB = r.text.strip()
+                _YF_SESSION_TS = time.time()
+                print(f"[ROBU] Yahoo Finance session ready (attempt {attempt})")
+                return
+            elif r.status_code == 429:
+                print(f"[ROBU] Yahoo 429 rate-limit — waiting {delay}s before retry {attempt}/{len(delays)}")
+                time.sleep(delay)
+            else:
+                print(f"[ROBU] Crumb fetch returned {r.status_code}: {r.text[:80]}")
+                time.sleep(delay)
+        except Exception as e:
+            print(f"[ROBU] Yahoo init error (attempt {attempt}): {e}")
+            time.sleep(delay)
+    print("[ROBU] Yahoo Finance session failed after all retries — data unavailable until next request")
 
 
 def _ensure_yahoo():
