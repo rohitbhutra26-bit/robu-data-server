@@ -38,36 +38,40 @@ app.add_middleware(
 # NSE Full Universe — downloaded from NSE on startup, cached locally 24h
 # ---------------------------------------------------------------------------
 _NSE_CSV_URL = "https://nsearchives.nseindia.com/content/equities/EQUITY_L.csv"
+_BSE_LIST_URL = "https://api.bseindia.com/BseIndiaAPI/api/ListofScripData/w?Group=&Scripcode=&industry=&segment=Equity&status=Active"
 _NSE_CACHE_FILE = os.path.join(os.path.dirname(__file__), "nse_equity_list.json")
 _NSE_CACHE_TTL_HOURS = 24
 
 # Fallback list if NSE CSV download fails
+def _nse(name: str, sector: str, sym: str) -> dict:
+    return {"name": name, "sector": sector, "exchange": "NSE", "yf_ticker": f"{sym}.NS"}
+
 _FALLBACK_STOCKS: dict[str, dict] = {
-    "RELIANCE":   {"name": "Reliance Industries Ltd",           "sector": "Energy"},
-    "TCS":        {"name": "Tata Consultancy Services Ltd",     "sector": "Information Technology"},
-    "INFY":       {"name": "Infosys Ltd",                       "sector": "Information Technology"},
-    "HDFCBANK":   {"name": "HDFC Bank Ltd",                     "sector": "Banking"},
-    "ICICIBANK":  {"name": "ICICI Bank Ltd",                    "sector": "Banking"},
-    "WIPRO":      {"name": "Wipro Ltd",                         "sector": "Information Technology"},
-    "BAJFINANCE": {"name": "Bajaj Finance Ltd",                 "sector": "NBFC"},
-    "HINDUNILVR": {"name": "Hindustan Unilever Ltd",            "sector": "FMCG"},
-    "ITC":        {"name": "ITC Ltd",                           "sector": "FMCG"},
-    "KOTAKBANK":  {"name": "Kotak Mahindra Bank Ltd",           "sector": "Banking"},
-    "LT":         {"name": "Larsen & Toubro Ltd",               "sector": "Infrastructure"},
-    "AXISBANK":   {"name": "Axis Bank Ltd",                     "sector": "Banking"},
-    "ASIANPAINT": {"name": "Asian Paints Ltd",                  "sector": "Consumer"},
-    "MARUTI":     {"name": "Maruti Suzuki India Ltd",           "sector": "Automobiles"},
-    "TITAN":      {"name": "Titan Company Ltd",                 "sector": "Consumer"},
-    "SUNPHARMA":  {"name": "Sun Pharmaceutical Industries Ltd", "sector": "Pharma"},
-    "HCLTECH":    {"name": "HCL Technologies Ltd",              "sector": "Information Technology"},
-    "TATAMOTORS": {"name": "Tata Motors Ltd",                   "sector": "Automobiles"},
-    "TATASTEEL":  {"name": "Tata Steel Ltd",                    "sector": "Metals"},
-    "SBIN":       {"name": "State Bank of India",               "sector": "Banking"},
-    "ADANIENT":   {"name": "Adani Enterprises Ltd",             "sector": "Conglomerate"},
-    "BHARTIARTL": {"name": "Bharti Airtel Ltd",                 "sector": "Telecom"},
-    "KAYNES":     {"name": "Kaynes Technology India Ltd",       "sector": "Electronics"},
-    "NTPC":       {"name": "NTPC Ltd",                          "sector": "Utilities"},
-    "ONGC":       {"name": "Oil & Natural Gas Corporation Ltd", "sector": "Energy"},
+    "RELIANCE":   _nse("Reliance Industries Ltd",           "Energy",                   "RELIANCE"),
+    "TCS":        _nse("Tata Consultancy Services Ltd",     "Information Technology",   "TCS"),
+    "INFY":       _nse("Infosys Ltd",                       "Information Technology",   "INFY"),
+    "HDFCBANK":   _nse("HDFC Bank Ltd",                     "Banking",                  "HDFCBANK"),
+    "ICICIBANK":  _nse("ICICI Bank Ltd",                    "Banking",                  "ICICIBANK"),
+    "WIPRO":      _nse("Wipro Ltd",                         "Information Technology",   "WIPRO"),
+    "BAJFINANCE": _nse("Bajaj Finance Ltd",                 "NBFC",                     "BAJFINANCE"),
+    "HINDUNILVR": _nse("Hindustan Unilever Ltd",            "FMCG",                     "HINDUNILVR"),
+    "ITC":        _nse("ITC Ltd",                           "FMCG",                     "ITC"),
+    "KOTAKBANK":  _nse("Kotak Mahindra Bank Ltd",           "Banking",                  "KOTAKBANK"),
+    "LT":         _nse("Larsen & Toubro Ltd",               "Infrastructure",           "LT"),
+    "AXISBANK":   _nse("Axis Bank Ltd",                     "Banking",                  "AXISBANK"),
+    "ASIANPAINT": _nse("Asian Paints Ltd",                  "Consumer",                 "ASIANPAINT"),
+    "MARUTI":     _nse("Maruti Suzuki India Ltd",           "Automobiles",              "MARUTI"),
+    "TITAN":      _nse("Titan Company Ltd",                 "Consumer",                 "TITAN"),
+    "SUNPHARMA":  _nse("Sun Pharmaceutical Industries Ltd", "Pharmaceuticals",          "SUNPHARMA"),
+    "HCLTECH":    _nse("HCL Technologies Ltd",              "Information Technology",   "HCLTECH"),
+    "TATAMOTORS": _nse("Tata Motors Ltd",                   "Automobiles",              "TATAMOTORS"),
+    "TATASTEEL":  _nse("Tata Steel Ltd",                    "Metals",                   "TATASTEEL"),
+    "SBIN":       _nse("State Bank of India",               "Banking",                  "SBIN"),
+    "ADANIENT":   _nse("Adani Enterprises Ltd",             "Conglomerate",             "ADANIENT"),
+    "BHARTIARTL": _nse("Bharti Airtel Ltd",                 "Telecom",                  "BHARTIARTL"),
+    "KAYNES":     _nse("Kaynes Technology India Ltd",       "Electronics",              "KAYNES"),
+    "NTPC":       _nse("NTPC Ltd",                          "Utilities",                "NTPC"),
+    "ONGC":       _nse("Oil & Natural Gas Corporation Ltd", "Energy",                   "ONGC"),
 }
 
 # In-memory stock universe: {SYMBOL: {name, sector}}
@@ -105,13 +109,20 @@ def _load_nse_universe():
         from io import StringIO
         df = pd.read_csv(StringIO(resp.text))
 
-        # NSE CSV columns: SYMBOL, NAME OF COMPANY, SERIES, ...
+        # NSE CSV columns: SYMBOL, NAME OF COMPANY, SERIES, ISIN NUMBER, ...
         universe = {}
         for _, row in df.iterrows():
             sym = str(row.get("SYMBOL", "")).strip().upper()
             name = str(row.get("NAME OF COMPANY", "")).strip()
+            isin = str(row.get("ISIN NUMBER", "")).strip()
             if sym and name and len(sym) > 0:
-                universe[sym] = {"name": name, "sector": "NSE Listed"}
+                universe[sym] = {
+                    "name": name,
+                    "sector": "NSE Listed",
+                    "exchange": "NSE",
+                    "isin": isin,
+                    "yf_ticker": f"{sym}.NS",
+                }
 
         if len(universe) > 100:
             STOCK_UNIVERSE = universe
@@ -128,8 +139,65 @@ def _load_nse_universe():
     print(f"[ROBU] Using fallback list of {len(STOCK_UNIVERSE)} stocks.")
 
 
+def _load_bse_universe():
+    """Fetch BSE equity list and add BSE-only stocks (not already in NSE) to universe."""
+    global STOCK_UNIVERSE
+    # Build ISIN → NSE symbol map from current universe
+    isin_to_nse = {
+        info.get("isin", ""): sym
+        for sym, info in STOCK_UNIVERSE.items()
+        if info.get("isin")
+    }
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "Referer": "https://www.bseindia.com/",
+            "Accept": "application/json, */*",
+        }
+        resp = requests.get(_BSE_LIST_URL, headers=headers, timeout=30)
+        if not resp.ok:
+            print(f"[ROBU] BSE list HTTP {resp.status_code} — skipping BSE universe")
+            return
+        items = resp.json()
+        if not isinstance(items, list):
+            print("[ROBU] BSE list unexpected format — skipping")
+            return
+
+        added = 0
+        for item in items:
+            code = str(item.get("Scripcode", "")).strip()
+            name = str(item.get("Scrip_Name", "")).strip()
+            isin = str(item.get("ISIN_NO", "")).strip()
+            sector = str(item.get("industry", "BSE Listed")).strip() or "BSE Listed"
+            if not code or not name:
+                continue
+            # Already in NSE universe (matched by ISIN) — skip, NSE is primary
+            if isin and isin in isin_to_nse:
+                continue
+            # BSE-only stock — add with numeric code as identifier
+            if code not in STOCK_UNIVERSE:
+                STOCK_UNIVERSE[code] = {
+                    "name": name,
+                    "sector": sector,
+                    "exchange": "BSE",
+                    "isin": isin,
+                    "yf_ticker": f"{code}.BO",
+                }
+                added += 1
+        print(f"[ROBU] BSE universe merged: {added} BSE-only stocks added")
+    except Exception as e:
+        print(f"[ROBU] BSE universe load failed: {e}")
+
+
+def _get_yf_ticker(symbol: str) -> str:
+    """Return the correct Yahoo Finance ticker for a symbol (e.g. TCS→TCS.NS, 500325→500325.BO)."""
+    info = STOCK_UNIVERSE.get(symbol, {})
+    return info.get("yf_ticker") or f"{symbol}.NS"
+
+
 # Load universe on startup
 _load_nse_universe()
+_load_bse_universe()
 
 
 # ---------------------------------------------------------------------------
@@ -262,36 +330,43 @@ def health():
     return {"status": "ok", "universe_size": len(STOCK_UNIVERSE)}
 
 
+def _search_row(sym: str, info: dict) -> dict:
+    """Return clean search result — only fields the frontend needs."""
+    return {
+        "symbol": sym,
+        "name": info.get("name", sym),
+        "sector": info.get("sector", ""),
+        "exchange": info.get("exchange", "NSE"),
+    }
+
+
 @app.get("/search")
 def search(q: str = ""):
-    """Search full NSE universe by symbol or company name."""
+    """Search NSE + BSE universe by symbol or company name."""
     q = q.strip()
     if not q:
-        # Return top 10 by default (popular stocks first)
         top = ["RELIANCE", "TCS", "INFY", "HDFCBANK", "ICICIBANK",
                "WIPRO", "BAJFINANCE", "ITC", "SBIN", "TATAMOTORS"]
-        results = []
-        for sym in top:
-            if sym in STOCK_UNIVERSE:
-                results.append({"symbol": sym, **STOCK_UNIVERSE[sym]})
-        return results
+        return [_search_row(sym, STOCK_UNIVERSE[sym]) for sym in top if sym in STOCK_UNIVERSE]
 
     q_lower = q.lower()
     exact, starts, contains = [], [], []
 
     for sym, info in STOCK_UNIVERSE.items():
         sym_lower = sym.lower()
-        name_lower = info["name"].lower()
+        name_lower = info.get("name", "").lower()
+        row = _search_row(sym, info)
         if sym_lower == q_lower:
-            exact.append({"symbol": sym, **info})
+            exact.append(row)
         elif sym_lower.startswith(q_lower) or name_lower.startswith(q_lower):
-            starts.append({"symbol": sym, **info})
+            starts.append(row)
         elif q_lower in sym_lower or q_lower in name_lower:
-            contains.append({"symbol": sym, **info})
+            contains.append(row)
 
-    # Best matches first
-    results = (exact + starts + contains)[:20]
-    return results
+    # NSE results first within each tier, then BSE
+    def _rank(r): return 0 if r["exchange"] == "NSE" else 1
+    exact.sort(key=_rank); starts.sort(key=_rank); contains.sort(key=_rank)
+    return (exact + starts + contains)[:20]
 
 
 @app.get("/company/{symbol}")
@@ -303,7 +378,7 @@ def company(symbol: str):
     if cached is not None:
         return cached
 
-    ns = symbol + ".NS"
+    ns = _get_yf_ticker(symbol)
     modules = "financialData,defaultKeyStatistics,assetProfile,summaryDetail,price"
     data = _yf_summary(ns, modules)
 
@@ -377,7 +452,7 @@ def financials(symbol: str):
     if cached is not None:
         return cached
 
-    ns = symbol + ".NS"
+    ns = _get_yf_ticker(symbol)
     # financialData gives TTM figures — used to fill FY gap when annual stmts lag
     data = _yf_summary(ns, "incomeStatementHistory,defaultKeyStatistics,financialData")
     stmts = (data.get("incomeStatementHistory") or {}).get("incomeStatementHistory") or []
