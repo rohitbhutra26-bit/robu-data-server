@@ -196,9 +196,14 @@ def _load_bse_universe():
 
 
 def _get_yf_ticker(symbol: str) -> str:
-    """Return the correct Yahoo Finance ticker for a symbol (e.g. TCS→TCS.NS, 500325→500325.BO)."""
+    """Return the correct Yahoo Finance ticker for a symbol (e.g. TCS→TCS.NS, 543652→543652.BO)."""
     info = STOCK_UNIVERSE.get(symbol, {})
-    return info.get("yf_ticker") or f"{symbol}.NS"
+    if info.get("yf_ticker"):
+        return info["yf_ticker"]
+    # Numeric-only symbols are BSE script codes
+    if symbol.isdigit():
+        return f"{symbol}.BO"
+    return f"{symbol}.NS"
 
 
 # Load universe on startup
@@ -356,9 +361,68 @@ def _search_row(sym: str, info: dict) -> dict:
     }
 
 
+def _yahoo_search(q: str) -> list[dict]:
+    """
+    Hit Yahoo Finance's search API to find Indian stocks (NSE + BSE).
+    Works even when BSE equity list API is blocked — Yahoo indexes everything.
+    Results are cached into STOCK_UNIVERSE so subsequent /company calls work.
+    """
+    try:
+        _ensure_yahoo()
+        if not _YF_SESSION_OBJ:
+            return []
+        resp = _YF_SESSION_OBJ.get(
+            "https://query2.finance.yahoo.com/v1/finance/search",
+            params={
+                "q": q,
+                "lang": "en-US",
+                "region": "IN",
+                "quotesCount": 12,
+                "newsCount": 0,
+                "listsCount": 0,
+                "crumb": _YF_CRUMB,
+            },
+            timeout=10,
+        )
+        if not resp.ok:
+            return []
+        quotes = resp.json().get("quotes", [])
+        results = []
+        for qt in quotes:
+            raw_sym = qt.get("symbol", "")
+            if not raw_sym:
+                continue
+            # Only Indian exchange tickers
+            if not (raw_sym.endswith(".NS") or raw_sym.endswith(".BO")):
+                continue
+            exchange = "BSE" if raw_sym.endswith(".BO") else "NSE"
+            clean_sym = raw_sym[:-3]  # strip .NS or .BO
+            name = qt.get("shortname") or qt.get("longname") or clean_sym
+            sector = qt.get("industry") or qt.get("sector") or f"{exchange} Listed"
+            # Register in universe so /company lookup works
+            if clean_sym not in STOCK_UNIVERSE:
+                STOCK_UNIVERSE[clean_sym] = {
+                    "name": name,
+                    "sector": sector,
+                    "exchange": exchange,
+                    "yf_ticker": raw_sym,
+                }
+            results.append({
+                "symbol": clean_sym,
+                "name": name,
+                "sector": sector,
+                "exchange": exchange,
+            })
+        return results
+    except Exception as e:
+        print(f"[ROBU] Yahoo search fallback error: {e}")
+        return []
+
+
 @app.get("/search")
 def search(q: str = ""):
-    """Search NSE + BSE universe by symbol or company name."""
+    """Search NSE + BSE universe by symbol or company name.
+    Falls back to Yahoo Finance search API for stocks not in local universe."""
     q = q.strip()
     if not q:
         top = ["RELIANCE", "TCS", "INFY", "HDFCBANK", "ICICIBANK",
@@ -381,8 +445,22 @@ def search(q: str = ""):
 
     # NSE results first within each tier, then BSE
     def _rank(r): return 0 if r["exchange"] == "NSE" else 1
-    exact.sort(key=_rank); starts.sort(key=_rank); contains.sort(key=_rank)
-    return (exact + starts + contains)[:20]
+    exact.sort(key=_rank)
+    starts.sort(key=_rank)
+    contains.sort(key=_rank)
+    local = (exact + starts + contains)[:20]
+
+    # If local universe has few hits, augment with Yahoo Finance live search
+    # This catches BSE-only stocks (SME, exclusive listings) not in local cache
+    if len(local) < 6 and len(q) >= 3:
+        yf_results = _yahoo_search(q)
+        seen = {r["symbol"] for r in local}
+        for r in yf_results:
+            if r["symbol"] not in seen:
+                local.append(r)
+                seen.add(r["symbol"])
+
+    return local[:20]
 
 
 @app.get("/company/{symbol}")
