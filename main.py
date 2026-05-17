@@ -704,6 +704,154 @@ def price(symbol: str):
     return result
 
 
+@app.get("/historical/{symbol}")
+def historical_valuation(symbol: str):
+    """
+    Return 5Y monthly price history + reconstructed P/E and P/B series.
+    Used by the Historical Valuation Chart on the frontend.
+
+    Logic:
+      - Fetch monthly OHLCV from Yahoo Finance chart API
+      - Fetch annual EPS from incomeStatementHistory
+      - Fetch annual BVPS from balanceSheetHistory
+      - For each monthly price, find trailing EPS/BVPS (most recent FY that ended before that month)
+      - Return points array + percentile stats
+    """
+    symbol = symbol.upper().strip()
+    cache_key = f"historical:{symbol}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    ns = _get_yf_ticker(symbol)
+    _ensure_yahoo()
+    if not _YF_SESSION_OBJ or not _YF_CRUMB:
+        raise HTTPException(503, "Yahoo Finance session unavailable")
+
+    # ── 1. Monthly price history (5Y) ──────────────────────────────────────
+    try:
+        chart_resp = _YF_SESSION_OBJ.get(
+            f"{_YF_HOST}/v8/finance/chart/{ns}",
+            params={"range": "5y", "interval": "1mo", "crumb": _YF_CRUMB},
+            timeout=20,
+        )
+        if not chart_resp.ok:
+            raise HTTPException(chart_resp.status_code, f"Chart API error for {ns}")
+        chart_json   = chart_resp.json()
+        chart_result = (chart_json.get("chart") or {}).get("result") or []
+        if not chart_result:
+            raise HTTPException(404, f"No chart data for {ns}")
+        cr         = chart_result[0]
+        timestamps = cr.get("timestamp") or []
+        closes     = (cr.get("indicators") or {}).get("quote", [{}])[0].get("close") or []
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(502, f"Chart fetch failed: {e}")
+
+    if not timestamps or not closes:
+        raise HTTPException(404, f"Empty chart data for {ns}")
+
+    # ── 2. Annual financials (EPS + Book Value) ───────────────────────────
+    try:
+        fin_data = _yf_summary(ns, "incomeStatementHistory,balanceSheetHistory,defaultKeyStatistics")
+    except Exception as e:
+        raise HTTPException(502, f"Financials fetch failed: {e}")
+
+    ks = fin_data.get("defaultKeyStatistics") or {}
+    so_raw = ks.get("sharesOutstanding")
+    shares = float(so_raw.get("raw", 0) if isinstance(so_raw, dict) else (so_raw or 0))
+
+    def rv(d: dict, key: str) -> float:
+        v = d.get(key)
+        if isinstance(v, dict): return safe_val(v.get("raw"))
+        return safe_val(v)
+
+    # Build EPS timeline: sorted list of (end_timestamp, eps_per_share)
+    eps_timeline: list[tuple[float, float]] = []
+    stmts = (fin_data.get("incomeStatementHistory") or {}).get("incomeStatementHistory") or []
+    for stmt in stmts:
+        end_ts  = (stmt.get("endDate") or {}).get("raw", 0)
+        pat     = rv(stmt, "netIncome")
+        eps_raw = rv(stmt, "basicEPS") or rv(stmt, "dilutedEPS") or rv(stmt, "basicEps") or rv(stmt, "dilutedEps")
+        if not eps_raw and pat and shares > 0:
+            eps_raw = pat / shares
+        if end_ts and eps_raw:
+            eps_timeline.append((float(end_ts), float(eps_raw)))
+    eps_timeline.sort(key=lambda x: x[0])
+
+    # Build BVPS timeline: sorted list of (end_timestamp, bvps)
+    bvps_timeline: list[tuple[float, float]] = []
+    bs_stmts = (fin_data.get("balanceSheetHistory") or {}).get("balanceSheetStatements") or []
+    for bs in bs_stmts:
+        end_ts = (bs.get("endDate") or {}).get("raw", 0)
+        equity = rv(bs, "totalStockholderEquity")
+        if end_ts and equity and shares > 0:
+            bvps_timeline.append((float(end_ts), float(equity) / shares))
+    bvps_timeline.sort(key=lambda x: x[0])
+
+    def trailing_value(timeline: list[tuple[float, float]], price_ts: float) -> float | None:
+        """Return the most recent value from timeline where end_ts <= price_ts."""
+        result = None
+        for end_ts, val in timeline:
+            if end_ts <= price_ts + 86400 * 90:   # allow 90-day lag for results release
+                result = val
+        return result
+
+    # ── 3. Build monthly data points ──────────────────────────────────────
+    points = []
+    for ts, price in zip(timestamps, closes):
+        if price is None or price <= 0:
+            continue
+        date_str = datetime.utcfromtimestamp(ts).strftime("%Y-%m")
+        eps  = trailing_value(eps_timeline,  float(ts))
+        bvps = trailing_value(bvps_timeline, float(ts))
+
+        pe_val = round(price / eps,  1)  if eps  and eps  > 0 else None
+        pb_val = round(price / bvps, 2)  if bvps and bvps > 0 else None
+
+        # Sanity cap — extreme outliers skew charts
+        if pe_val and (pe_val < 0 or pe_val > 500):  pe_val  = None
+        if pb_val and (pb_val < 0 or pb_val > 100):  pb_val  = None
+
+        points.append({"date": date_str, "price": round(price, 2), "pe": pe_val, "pb": pb_val})
+
+    if not points:
+        raise HTTPException(404, "No valid historical data points")
+
+    # ── 4. Statistics ─────────────────────────────────────────────────────
+    def _stats(vals: list[float]) -> dict:
+        if not vals:
+            return {"min": 0, "max": 0, "median": 0, "p25": 0, "p75": 0, "mean": 0}
+        sv   = sorted(vals)
+        n    = len(sv)
+        med  = sv[n // 2] if n % 2 else (sv[n // 2 - 1] + sv[n // 2]) / 2
+        p25  = sv[int(n * 0.25)]
+        p75  = sv[int(n * 0.75)]
+        return {
+            "min":    round(min(sv), 2),
+            "max":    round(max(sv), 2),
+            "median": round(med,     2),
+            "p25":    round(p25,     2),
+            "p75":    round(p75,     2),
+            "mean":   round(sum(sv) / n, 2),
+        }
+
+    pe_vals  = [p["pe"]  for p in points if p["pe"]  is not None]
+    pb_vals  = [p["pb"]  for p in points if p["pb"]  is not None]
+
+    result = {
+        "symbol": symbol,
+        "points": points,
+        "stats": {
+            "pe": _stats(pe_vals),
+            "pb": _stats(pb_vals),
+        },
+    }
+    _cache_set(cache_key, result)
+    return result
+
+
 @app.get("/universe/size")
 def universe_size():
     return {"count": len(STOCK_UNIVERSE), "source": "NSE EQUITY_L.csv"}
