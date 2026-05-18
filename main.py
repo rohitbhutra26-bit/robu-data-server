@@ -18,11 +18,344 @@ import requests
 from datetime import datetime, timedelta
 from typing import Any
 
+import re
+try:
+    from bs4 import BeautifulSoup
+    _BS4_AVAILABLE = True
+except ImportError:
+    _BS4_AVAILABLE = False
+
 try:
     from curl_cffi import requests as cffi_requests
     _CURL_AVAILABLE = True
 except ImportError:
     _CURL_AVAILABLE = False
+
+# ---------------------------------------------------------------------------
+# Screener.in Integration
+# ---------------------------------------------------------------------------
+# Screener.in reads BSE/NSE regulatory filings directly — most accurate source
+# for Indian stock fundamentals. Revenue is always in ₹ Crore. No unit guessing.
+#
+# Architecture:
+#   Screener.in  → all fundamentals (P/E, P/B, ROE, revenue, PAT, EPS, OCF)
+#   Yahoo Finance → live price, change%, 52w high/low, beta (it's good at these)
+#   Yahoo Finance → historical price series for the valuation chart
+#
+# To enable authenticated access (gets more data, more reliable):
+#   Set SCREENER_USERNAME and SCREENER_PASSWORD env vars in Render.
+#   Free account at screener.in is sufficient.
+#   Without creds: falls back to public page scraping (still works, less reliable).
+# ---------------------------------------------------------------------------
+
+SCREENER_USERNAME = os.environ.get("SCREENER_USERNAME", "")
+SCREENER_PASSWORD = os.environ.get("SCREENER_PASSWORD", "")
+
+_screener_session: Any = None          # requests.Session kept alive
+_screener_session_at: float = 0        # unix timestamp when session was created
+_SCREENER_SESSION_TTL = 18 * 3600      # reauth every 18 hours
+
+
+def _make_browser_headers(referer: str = "https://www.screener.in/") -> dict:
+    return {
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Referer": referer,
+    }
+
+
+def _get_screener_session():
+    """
+    Return an authenticated requests.Session for Screener.in.
+    Logs in once, caches session for 18 hours. Returns None if no credentials.
+    """
+    global _screener_session, _screener_session_at
+
+    if not SCREENER_USERNAME or not SCREENER_PASSWORD:
+        return None  # No creds → caller uses public page scraping
+
+    # Return cached session if still fresh
+    if _screener_session and (time.time() - _screener_session_at) < _SCREENER_SESSION_TTL:
+        return _screener_session
+
+    try:
+        sess = requests.Session()
+        sess.headers.update(_make_browser_headers())
+
+        # Step 1: GET login page → extract Django CSRF token
+        login_page = sess.get("https://www.screener.in/login/", timeout=15)
+        if not _BS4_AVAILABLE:
+            print("[Screener] BeautifulSoup not available — cannot authenticate")
+            return None
+
+        soup = BeautifulSoup(login_page.text, "lxml")
+        csrf_el = soup.find("input", {"name": "csrfmiddlewaretoken"})
+        if not csrf_el:
+            print("[Screener] CSRF token not found on login page")
+            return None
+        csrf_token = csrf_el.get("value", "")
+
+        # Step 2: POST credentials
+        resp = sess.post(
+            "https://www.screener.in/login/",
+            data={
+                "username": SCREENER_USERNAME,
+                "password": SCREENER_PASSWORD,
+                "csrfmiddlewaretoken": csrf_token,
+                "next": "/",
+            },
+            headers={"Referer": "https://www.screener.in/login/"},
+            allow_redirects=True,
+            timeout=15,
+        )
+
+        # Login succeeded if we're no longer on the login page
+        if resp.status_code == 200 and "/login" not in resp.url:
+            _screener_session = sess
+            _screener_session_at = time.time()
+            print(f"[Screener] Authenticated as {SCREENER_USERNAME}")
+            return sess
+        else:
+            print(f"[Screener] Login failed — status {resp.status_code}, url {resp.url}")
+            return None
+
+    except Exception as e:
+        print(f"[Screener] Auth error: {e}")
+        return None
+
+
+def _fetch_screener_page(symbol: str) -> Any:
+    """
+    Fetch and parse the Screener.in consolidated company page.
+    Returns a BeautifulSoup object or None.
+    Tries authenticated session first; falls back to public access.
+    """
+    if not _BS4_AVAILABLE:
+        return None
+
+    sess = _get_screener_session()
+
+    for variant in ["consolidated", ""]:
+        url = f"https://www.screener.in/company/{symbol}/{variant}/"
+        try:
+            if sess:
+                resp = sess.get(url, timeout=20)
+            elif _CURL_AVAILABLE:
+                resp = cffi_requests.get(
+                    url, headers=_make_browser_headers(), timeout=20, impersonate="chrome124"
+                )
+            else:
+                resp = requests.get(url, headers=_make_browser_headers(), timeout=20)
+
+            if resp.status_code != 200:
+                continue
+
+            soup = BeautifulSoup(resp.text, "lxml")
+            # Verify it's a real company page (not search/404)
+            if soup.find(id="top-ratios") or soup.find(id="profit-loss"):
+                return soup
+
+        except Exception as e:
+            print(f"[Screener] Fetch error {symbol} ({variant}): {e}")
+            continue
+
+    return None
+
+
+def _cr(val_str: str) -> float:
+    """
+    Parse a ₹ Crore value string from Screener.
+    Handles: '1,25,432', '12,345.67', '1.25L', '-234'
+    All Screener financials are already in ₹ Crore — no conversion needed.
+    """
+    try:
+        v = val_str.strip().replace(",", "").replace("₹", "").replace("Cr.", "").replace("Cr", "").strip()
+        if not v or v == "--" or v == "":
+            return 0.0
+        # Handle Lakh Crore suffix (e.g. "1.25L" = 1,25,000 Cr)
+        if v.endswith("L") or v.endswith("l"):
+            return float(v[:-1]) * 100000
+        return float(v)
+    except Exception:
+        return 0.0
+
+
+def _parse_screener_ratios(soup: Any) -> dict:
+    """
+    Extract key ratios from the #top-ratios section.
+    Returns dict with: currentPrice, marketCap, pe, pb, roe, dividendYield,
+                       bookValue, roce, debtToEquity (derived), sector
+    """
+    ratios: dict = {}
+
+    # ── Key ratios list ──────────────────────────────────────────────────────
+    ratio_ul = soup.find(id="top-ratios")
+    if ratio_ul:
+        for li in ratio_ul.find_all("li"):
+            spans = li.find_all("span")
+            if len(spans) < 2:
+                continue
+            name  = spans[0].get_text(strip=True).lower()
+            value = spans[-1].get_text(strip=True).replace(",", "").replace("₹", "").replace("%", "").replace("Cr.", "").replace("Cr", "").strip()
+
+            try:
+                if "market cap" in name:
+                    ratios["marketCap"] = _cr(value)
+                elif "current price" in name:
+                    ratios["currentPrice"] = float(value)
+                elif name in ("stock p/e", "p/e"):
+                    ratios["pe"] = float(value)
+                elif "book value" in name:
+                    ratios["bookValue"] = float(value)
+                elif "dividend yield" in name:
+                    ratios["dividendYield"] = float(value)
+                elif "roce" in name:
+                    ratios["roce"] = float(value)
+                elif "roe" in name and "roce" not in name:
+                    ratios["roe"] = float(value)
+                elif "debt / equity" in name or "debt/equity" in name:
+                    ratios["debtToEquity"] = float(value)
+            except (ValueError, TypeError):
+                pass
+
+    # Derive P/B from price / book value (more accurate than Yahoo)
+    price = ratios.get("currentPrice", 0)
+    bv    = ratios.get("bookValue", 0)
+    if price > 0 and bv > 0:
+        ratios["pb"] = round(price / bv, 2)
+
+    # ── Sector from company info section ────────────────────────────────────
+    about = soup.find(id="about") or soup.find(class_="company-info")
+    if about:
+        sector_el = about.find(text=re.compile(r"Sector", re.I))
+        if sector_el:
+            sector_parent = sector_el.parent
+            if sector_parent:
+                nxt = sector_parent.find_next_sibling()
+                if nxt:
+                    ratios["sector"] = nxt.get_text(strip=True)
+
+    # Fallback: check meta description or title for sector hints
+    if "sector" not in ratios:
+        meta = soup.find("meta", {"name": "description"})
+        if meta:
+            content = meta.get("content", "")
+            # Screener often puts sector in description
+            m = re.search(r'in the ([A-Za-z &]+) sector', content)
+            if m:
+                ratios["sector"] = m.group(1).strip()
+
+    return ratios
+
+
+def _parse_screener_financials(soup: Any) -> list:
+    """
+    Parse the Profit & Loss and Cash Flow tables from Screener.in.
+    Returns list of FinancialYear dicts (last 5 years, newest last).
+    All values already in ₹ Crore — no conversion needed.
+    """
+
+    def _parse_table(section_id: str):
+        """Extract years + row data from a Screener data table."""
+        section = soup.find(id=section_id)
+        if not section:
+            return [], {}
+
+        table = section.find("table")
+        if not table:
+            return [], {}
+
+        # Year headers — "Mar 2024", "Mar 2023", ...
+        years = []
+        thead = table.find("thead")
+        if thead:
+            for th in thead.find_all("th")[1:]:
+                txt = th.get_text(strip=True)
+                m = re.search(r"(\d{4})", txt)
+                if m:
+                    years.append(f"FY{m.group(1)[2:]}")
+                elif "ttm" in txt.lower():
+                    years.append("TTM")
+
+        # Row data
+        rows: dict = {}
+        tbody = table.find("tbody")
+        if tbody:
+            for tr in tbody.find_all("tr"):
+                cells = tr.find_all("td")
+                if not cells:
+                    continue
+                label = cells[0].get_text(strip=True).lower().rstrip(" +").strip()
+                vals  = []
+                for td in cells[1: len(years) + 1]:
+                    txt = td.get_text(strip=True)
+                    vals.append(_cr(txt))
+                rows[label] = vals
+
+        return years, rows
+
+    def _row(rows: dict, *keywords) -> list:
+        """Find the first row whose label contains any of the keywords."""
+        for kw in keywords:
+            for label, vals in rows.items():
+                if kw in label:
+                    return vals
+        return []
+
+    pl_years, pl_rows = _parse_table("profit-loss")
+    cf_years, cf_rows = _parse_table("cash-flow")
+
+    if not pl_years:
+        return []
+
+    revenues = _row(pl_rows, "sales", "revenue", "net interest income", "total income")
+    pats     = _row(pl_rows, "net profit", "profit after tax", "pat")
+    epss     = _row(pl_rows, "eps in rs", "eps (in rs)", "eps", "earning per share")
+    ebitdas  = _row(pl_rows, "operating profit")
+    opm_pcts = _row(pl_rows, "opm %", "opm%", "operating profit margin")
+    ocfs     = _row(cf_rows, "cash from operating", "operating activities", "net cash from operating")
+
+    result = []
+    prev_rev: float = 0.0
+
+    for i, yr in enumerate(pl_years):
+        if yr == "TTM":
+            continue  # TTM injected separately via Yahoo for freshness
+
+        rev  = revenues[i] if i < len(revenues) else 0.0
+        pat  = pats[i]     if i < len(pats)     else 0.0
+        eps  = epss[i]     if i < len(epss)      else 0.0
+        ebit = ebitdas[i]  if i < len(ebitdas)   else 0.0
+        opm  = opm_pcts[i] if i < len(opm_pcts)  else 0.0
+        ocf  = ocfs[i]     if i < len(ocfs)       else 0.0
+
+        net_margin   = round((pat / rev) * 100, 2)  if rev > 0 else 0.0
+        ebitda_pct   = opm if opm != 0 else (round((ebit / rev) * 100, 2) if rev > 0 else 0.0)
+        rev_growth   = round(((rev - prev_rev) / prev_rev) * 100, 2) if prev_rev > 0 and rev > 0 else 0.0
+        prev_rev     = rev if rev > 0 else prev_rev
+
+        result.append({
+            "year":          yr,
+            "revenue":       round(rev,  2),
+            "pat":           round(pat,  2),
+            "ebitda":        round(ebit, 2),
+            "eps":           round(eps,  2),
+            "netMargin":     net_margin,
+            "revenueGrowth": rev_growth,
+            "ebitdaMargin":  round(ebitda_pct, 2),
+            "ocf":           round(ocf,  2),   # Operating Cash Flow — not in Yahoo Finance
+            "source":        "screener",
+        })
+
+    # Keep last 5 full years (drop older ones)
+    annual = [r for r in result if not r["year"].startswith("TTM")]
+    return annual[-5:]
 
 app = FastAPI(title="ROBU Data Server", version="2.0.0")
 
@@ -677,17 +1010,118 @@ def financials(symbol: str):
     return rows
 
 
+@app.get("/company-v2/{symbol}")
+def company_v2(symbol: str):
+    """
+    Company fundamentals — Screener.in primary, Yahoo Finance fallback.
+
+    Screener gives: P/E, P/B, ROE, ROCE, Market Cap, Book Value, D/E from BSE filings.
+    Yahoo gives:    live price, change%, 52-week high/low, beta, shares outstanding.
+    Combined:       best-of-both response with same interface as /company.
+    """
+    symbol = symbol.upper().strip()
+    cache_key = f"company_v2:{symbol}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    # ── Always fetch live price from Yahoo — it's reliable for this ──────────
+    ns   = _get_yf_ticker(symbol)
+    data = _yf_summary(ns, "price,defaultKeyStatistics,summaryDetail,assetProfile,financialData")
+
+    pr = data.get("price", {})
+    ks = data.get("defaultKeyStatistics", {})
+    sd = data.get("summaryDetail", {})
+    ap = data.get("assetProfile", {})
+    fd = data.get("financialData", {})
+
+    def rv(d: dict, key: str) -> Any:
+        v = d.get(key)
+        if isinstance(v, dict):
+            return v.get("raw")
+        return v
+
+    price_val  = safe_val(rv(pr, "regularMarketPrice") or rv(fd, "currentPrice"))
+    prev_close = safe_val(rv(pr, "regularMarketPreviousClose") or rv(sd, "previousClose"))
+    change     = round(price_val - prev_close, 2) if prev_close else 0.0
+    change_pct = round((change / prev_close) * 100, 2) if prev_close else 0.0
+    shares_cr  = round(safe_val(rv(ks, "sharesOutstanding")) / 1e7, 2)
+    beta       = safe_val(rv(ks, "beta"))
+    w52_high   = safe_val(rv(sd, "fiftyTwoWeekHigh"))
+    w52_low    = safe_val(rv(sd, "fiftyTwoWeekLow"))
+    rev_g      = rv(fd, "revenueGrowth")
+    ear_g      = rv(fd, "earningsGrowth")
+    fwd_pe     = safe_val(rv(sd, "forwardPE"))
+
+    if price_val == 0:
+        raise HTTPException(404, f"No price data for {ns}")
+
+    stock_meta = STOCK_UNIVERSE.get(symbol, {})
+
+    # Build base result from Yahoo (always available)
+    result = {
+        "symbol":         symbol,
+        "name":           rv(pr, "longName") or rv(pr, "shortName") or stock_meta.get("name", symbol),
+        "sector":         ap.get("sector") or stock_meta.get("sector", "Unknown"),
+        "industry":       ap.get("industry", ""),
+        "currentPrice":   price_val,
+        "previousClose":  prev_close,
+        "change":         change,
+        "changePct":      change_pct,
+        "marketCap":      round(safe_val(rv(pr, "marketCap") or rv(sd, "marketCap")) / 1e7, 2),
+        "pe":             safe_val(rv(sd, "trailingPE")),
+        "forwardPE":      fwd_pe,
+        "pb":             safe_val(rv(ks, "priceToBook")),
+        "roe":            round(float(rv(fd, "returnOnEquity")) * 100, 2) if rv(fd, "returnOnEquity") else 0.0,
+        "roa":            round(float(rv(fd, "returnOnAssets")) * 100, 2) if rv(fd, "returnOnAssets") else 0.0,
+        "eps":            safe_val(rv(ks, "trailingEps")),
+        "dividendYield":  round(float(rv(sd, "dividendYield")) * 100, 2) if rv(sd, "dividendYield") else 0.0,
+        "week52High":     w52_high,
+        "week52Low":      w52_low,
+        "debtToEquity":   round(safe_val(rv(fd, "debtToEquity")) / 100, 2) if rv(fd, "debtToEquity") else 0.0,
+        "currentRatio":   safe_val(rv(fd, "currentRatio")),
+        "shares":         shares_cr,
+        "beta":           beta,
+        "revenueGrowth":  round(float(rev_g) * 100, 2) if rev_g else 0.0,
+        "earningsGrowth": round(float(ear_g) * 100, 2) if ear_g else 0.0,
+        "dataSource":     "yahoo",
+    }
+
+    # ── Overlay with Screener.in fundamentals (much more accurate) ────────────
+    try:
+        soup = _fetch_screener_page(symbol)
+        if soup:
+            ratios = _parse_screener_ratios(soup)
+
+            # Screener values override Yahoo for these fields (higher accuracy)
+            if ratios.get("pe",          0) > 0:  result["pe"]          = ratios["pe"]
+            if ratios.get("pb",          0) > 0:  result["pb"]          = ratios["pb"]
+            if ratios.get("roe",         0) > 0:  result["roe"]         = ratios["roe"]
+            if ratios.get("roce",        0) > 0:  result["roce"]        = ratios["roce"]
+            if ratios.get("marketCap",   0) > 0:  result["marketCap"]   = ratios["marketCap"]
+            if ratios.get("bookValue",   0) > 0:  result["bookValue"]   = ratios["bookValue"]
+            if ratios.get("dividendYield",0) >= 0: result["dividendYield"] = ratios.get("dividendYield", result["dividendYield"])
+            if ratios.get("debtToEquity",0) > 0:  result["debtToEquity"]  = ratios["debtToEquity"]
+            if ratios.get("sector",      ""):     result["sector"]       = ratios["sector"]
+
+            result["dataSource"] = "screener+yahoo"
+            print(f"[Screener] {symbol}: fundamentals loaded from Screener.in ✓")
+        else:
+            print(f"[Screener] {symbol}: page unavailable, using Yahoo fundamentals")
+
+    except Exception as e:
+        print(f"[Screener] {symbol} overlay error: {e}")
+
+    _cache_set(cache_key, result)
+    return result
+
+
 @app.get("/financials-v2/{symbol}")
 def financials_v2(symbol: str):
     """
-    Accurate financials from Screener.in — parses BSE-filed data directly.
-
-    Why: Yahoo Finance returns inconsistent units for Indian stocks (absolute ₹ vs ₹ Crore).
-    Screener.in parses BSE/NSE regulatory filings — revenue is always in ₹ Crore.
-    10 years of history. Cash flow data included (OCF — not available from Yahoo).
-
+    Financials from Screener.in (BeautifulSoup parsed) — revenue always in ₹ Crore.
+    Includes OCF (Operating Cash Flow) which Yahoo Finance doesn't reliably provide.
     Falls back to /financials (Yahoo) if Screener is unavailable.
-    Cached 15 minutes (same as Yahoo endpoint).
     """
     symbol = symbol.upper().strip()
     cache_key = f"financials_v2:{symbol}"
@@ -695,191 +1129,37 @@ def financials_v2(symbol: str):
     if cached is not None:
         return cached
 
-    # ── Screener.in scrape ──────────────────────────────────────────────────
-    # URL format: https://www.screener.in/company/{SYMBOL}/consolidated/
-    # The consolidated view shows group-level numbers (what analysts use).
-    # Falls back to standalone if consolidated not available.
-    def _scrape_screener(sym: str):
-        import re
-        from html.parser import HTMLParser
-
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                          "AppleWebKit/537.36 (KHTML, like Gecko) "
-                          "Chrome/124.0.0.0 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Referer": "https://www.screener.in/",
-        }
-
-        for variant in ["consolidated", ""]:
-            url = f"https://www.screener.in/company/{sym}/{variant}/"
-            try:
-                if _CURL_AVAILABLE:
-                    resp = cffi_requests.get(url, headers=headers, timeout=15, impersonate="chrome124")
-                else:
-                    resp = requests.get(url, headers=headers, timeout=15)
-
-                if resp.status_code != 200:
-                    continue
-
-                html = resp.text
-
-                # ── Parse the Profit & Loss table ──────────────────────────
-                # Screener renders a table with id="profit-loss" or section "profit-loss"
-                # Each row is a financial metric; columns are years.
-                # We extract: Sales (=Revenue), Net Profit (=PAT), EPS
-
-                # Find the profit-loss section
-                pl_match = re.search(
-                    r'<section[^>]+id=["\']profit-loss["\'][^>]*>(.*?)</section>',
-                    html, re.DOTALL | re.IGNORECASE
-                )
-                if not pl_match:
-                    # Try alternate structure
-                    pl_match = re.search(
-                        r'Profit &amp; Loss.*?(<table.*?</table>)',
-                        html, re.DOTALL | re.IGNORECASE
-                    )
-
-                if not pl_match:
-                    continue
-
-                section_html = pl_match.group(1)
-
-                # Extract year headers from thead
-                years = re.findall(r'<th[^>]*>\s*(?:Mar\s+)?(\d{4})\s*</th>', section_html)
-                if not years:
-                    # Try alternate year format: "FY24" or "2024"
-                    years = re.findall(r'<th[^>]*>\s*(?:FY)?(\d{2,4})\s*</th>', section_html)
-
-                if not years:
-                    continue
-
-                # Normalise years: "24" → "FY24", "2024" → "FY24"
-                def _norm_year(y: str) -> str:
-                    if len(y) == 4:
-                        return f"FY{y[2:]}"
-                    return f"FY{y}"
-
-                years = [_norm_year(y) for y in years[-10:]]  # last 10 years max
-
-                # Extract row data — each <tr> has a label and values
-                rows_raw = re.findall(r'<tr[^>]*>(.*?)</tr>', section_html, re.DOTALL)
-
-                def _parse_cells(row_html: str):
-                    """Extract all <td> text values from a row."""
-                    cells = re.findall(r'<td[^>]*>(.*?)</td>', row_html, re.DOTALL)
-                    return [re.sub(r'<[^>]+>', '', c).strip().replace(',', '') for c in cells]
-
-                def _to_cr(val: str) -> float:
-                    """Screener shows numbers in ₹ Crore already. Parse safely."""
-                    try:
-                        v = float(val.replace('%', '').replace('₹', '').strip())
-                        return v
-                    except Exception:
-                        return 0.0
-
-                data_rows: dict[str, list[float]] = {}
-                for row_html in rows_raw:
-                    cells = _parse_cells(row_html)
-                    if len(cells) < 2:
-                        continue
-                    label = cells[0].strip().lower()
-                    values = [_to_cr(c) for c in cells[1:len(years)+1]]
-                    if len(values) < len(years):
-                        values += [0.0] * (len(years) - len(values))
-
-                    # Map Screener labels to our field names
-                    if any(k in label for k in ['sales', 'revenue', 'net interest income', 'income']):
-                        if 'revenue' not in data_rows:
-                            data_rows['revenue'] = values
-                    elif 'net profit' in label or 'pat' in label:
-                        data_rows['pat'] = values
-                    elif 'eps' in label and 'diluted' not in label:
-                        data_rows['eps'] = values
-                    elif 'eps in rs' in label or 'basic eps' in label or 'diluted eps' in label:
-                        if 'eps' not in data_rows:
-                            data_rows['eps'] = values
-                    elif 'operating profit' in label and 'margin' not in label:
-                        data_rows['ebitda'] = values
-                    elif 'opm' in label or 'operating profit margin' in label:
-                        data_rows['ebitdaMargin'] = values
-
-                if 'revenue' not in data_rows or not years:
-                    continue
-
-                # ── Build output rows ──────────────────────────────────────
-                result = []
-                revenues = data_rows.get('revenue', [])
-                pats     = data_rows.get('pat', [])
-                ebitdas  = data_rows.get('ebitda', [])
-                epss     = data_rows.get('eps', [])
-                ebitda_margins = data_rows.get('ebitdaMargin', [])
-
-                for i, yr in enumerate(years):
-                    rev  = revenues[i] if i < len(revenues) else 0.0
-                    pat  = pats[i]     if i < len(pats)     else 0.0
-                    ebit = ebitdas[i]  if i < len(ebitdas)  else 0.0
-                    eps  = epss[i]     if i < len(epss)     else 0.0
-
-                    net_margin   = round((pat / rev) * 100, 2) if rev > 0 else 0.0
-                    ebitda_pct   = (ebitda_margins[i] if i < len(ebitda_margins)
-                                    else (round((ebit / rev) * 100, 2) if rev > 0 else 0.0))
-                    rev_growth   = 0.0
-                    if i > 0 and revenues[i-1] > 0 and rev > 0:
-                        rev_growth = round(((rev - revenues[i-1]) / revenues[i-1]) * 100, 2)
-
-                    result.append({
-                        "year":         yr,
-                        "revenue":      round(rev, 2),
-                        "pat":          round(pat, 2),
-                        "ebitda":       round(ebit, 2),
-                        "eps":          round(eps, 2),
-                        "netMargin":    net_margin,
-                        "revenueGrowth":rev_growth,
-                        "ebitdaMargin": round(ebitda_pct, 2),
-                        "source":       "screener",
-                    })
-
-                # Return last 5 years only (most relevant)
-                return result[-5:] if len(result) >= 5 else result
-
-            except Exception as e:
-                print(f"[Screener] {sym} ({variant}): {e}")
-                continue
-
-        return None  # Both variants failed
-
-    # ── Try Screener first, fall back to Yahoo ──────────────────────────────
+    # ── Try Screener.in (BS4-parsed, reliable) ───────────────────────────────
     screener_data = None
     try:
-        screener_data = _scrape_screener(symbol)
+        soup = _fetch_screener_page(symbol)
+        if soup:
+            screener_data = _parse_screener_financials(soup)
     except Exception as e:
-        print(f"[Screener] Outer error for {symbol}: {e}")
+        print(f"[Screener] financials_v2 error for {symbol}: {e}")
 
     if screener_data and len(screener_data) >= 2:
-        # Add shares from Yahoo (Screener doesn't have it directly)
+        # Attach shares from Yahoo (Screener doesn't expose shares outstanding directly)
         try:
-            ns = _get_yf_ticker(symbol)
-            ks_data = _yf_summary(ns, "defaultKeyStatistics")
-            ks = ks_data.get("defaultKeyStatistics") or {}
-            so_raw = ks.get("sharesOutstanding")
-            shares_cr = float(so_raw.get("raw", 0) if isinstance(so_raw, dict) else (so_raw or 0)) / 1e7
+            ns     = _get_yf_ticker(symbol)
+            ks_raw = _yf_summary(ns, "defaultKeyStatistics").get("defaultKeyStatistics", {})
+            so_raw = ks_raw.get("sharesOutstanding")
+            shares_cr = float(
+                so_raw.get("raw", 0) if isinstance(so_raw, dict) else (so_raw or 0)
+            ) / 1e7
             for row in screener_data:
                 row["shares"] = round(shares_cr, 2)
         except Exception:
-            pass  # shares optional — model has fallback
+            pass  # shares is optional — valuation models have fallbacks
 
         _cache_set(cache_key, screener_data)
-        print(f"[Screener] {symbol}: returned {len(screener_data)} years from Screener.in")
+        print(f"[Screener] {symbol}: {len(screener_data)} years from Screener.in ✓")
         return screener_data
 
-    # ── Fallback: Yahoo Finance financials ──────────────────────────────────
-    print(f"[Screener] {symbol}: falling back to Yahoo Finance")
+    # ── Fallback: Yahoo Finance ──────────────────────────────────────────────
+    print(f"[Screener] {symbol}: Screener unavailable, using Yahoo Finance")
     try:
-        yahoo_data = financials(symbol)   # calls the existing /financials endpoint logic
-        # Tag rows so UI can show the source
+        yahoo_data = financials(symbol)
         for row in yahoo_data:
             row["source"] = "yahoo"
         _cache_set(cache_key, yahoo_data)
