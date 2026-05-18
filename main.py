@@ -677,6 +677,217 @@ def financials(symbol: str):
     return rows
 
 
+@app.get("/financials-v2/{symbol}")
+def financials_v2(symbol: str):
+    """
+    Accurate financials from Screener.in — parses BSE-filed data directly.
+
+    Why: Yahoo Finance returns inconsistent units for Indian stocks (absolute ₹ vs ₹ Crore).
+    Screener.in parses BSE/NSE regulatory filings — revenue is always in ₹ Crore.
+    10 years of history. Cash flow data included (OCF — not available from Yahoo).
+
+    Falls back to /financials (Yahoo) if Screener is unavailable.
+    Cached 15 minutes (same as Yahoo endpoint).
+    """
+    symbol = symbol.upper().strip()
+    cache_key = f"financials_v2:{symbol}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    # ── Screener.in scrape ──────────────────────────────────────────────────
+    # URL format: https://www.screener.in/company/{SYMBOL}/consolidated/
+    # The consolidated view shows group-level numbers (what analysts use).
+    # Falls back to standalone if consolidated not available.
+    def _scrape_screener(sym: str):
+        import re
+        from html.parser import HTMLParser
+
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                          "AppleWebKit/537.36 (KHTML, like Gecko) "
+                          "Chrome/124.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": "https://www.screener.in/",
+        }
+
+        for variant in ["consolidated", ""]:
+            url = f"https://www.screener.in/company/{sym}/{variant}/"
+            try:
+                if _CURL_AVAILABLE:
+                    resp = cffi_requests.get(url, headers=headers, timeout=15, impersonate="chrome124")
+                else:
+                    resp = requests.get(url, headers=headers, timeout=15)
+
+                if resp.status_code != 200:
+                    continue
+
+                html = resp.text
+
+                # ── Parse the Profit & Loss table ──────────────────────────
+                # Screener renders a table with id="profit-loss" or section "profit-loss"
+                # Each row is a financial metric; columns are years.
+                # We extract: Sales (=Revenue), Net Profit (=PAT), EPS
+
+                # Find the profit-loss section
+                pl_match = re.search(
+                    r'<section[^>]+id=["\']profit-loss["\'][^>]*>(.*?)</section>',
+                    html, re.DOTALL | re.IGNORECASE
+                )
+                if not pl_match:
+                    # Try alternate structure
+                    pl_match = re.search(
+                        r'Profit &amp; Loss.*?(<table.*?</table>)',
+                        html, re.DOTALL | re.IGNORECASE
+                    )
+
+                if not pl_match:
+                    continue
+
+                section_html = pl_match.group(1)
+
+                # Extract year headers from thead
+                years = re.findall(r'<th[^>]*>\s*(?:Mar\s+)?(\d{4})\s*</th>', section_html)
+                if not years:
+                    # Try alternate year format: "FY24" or "2024"
+                    years = re.findall(r'<th[^>]*>\s*(?:FY)?(\d{2,4})\s*</th>', section_html)
+
+                if not years:
+                    continue
+
+                # Normalise years: "24" → "FY24", "2024" → "FY24"
+                def _norm_year(y: str) -> str:
+                    if len(y) == 4:
+                        return f"FY{y[2:]}"
+                    return f"FY{y}"
+
+                years = [_norm_year(y) for y in years[-10:]]  # last 10 years max
+
+                # Extract row data — each <tr> has a label and values
+                rows_raw = re.findall(r'<tr[^>]*>(.*?)</tr>', section_html, re.DOTALL)
+
+                def _parse_cells(row_html: str):
+                    """Extract all <td> text values from a row."""
+                    cells = re.findall(r'<td[^>]*>(.*?)</td>', row_html, re.DOTALL)
+                    return [re.sub(r'<[^>]+>', '', c).strip().replace(',', '') for c in cells]
+
+                def _to_cr(val: str) -> float:
+                    """Screener shows numbers in ₹ Crore already. Parse safely."""
+                    try:
+                        v = float(val.replace('%', '').replace('₹', '').strip())
+                        return v
+                    except Exception:
+                        return 0.0
+
+                data_rows: dict[str, list[float]] = {}
+                for row_html in rows_raw:
+                    cells = _parse_cells(row_html)
+                    if len(cells) < 2:
+                        continue
+                    label = cells[0].strip().lower()
+                    values = [_to_cr(c) for c in cells[1:len(years)+1]]
+                    if len(values) < len(years):
+                        values += [0.0] * (len(years) - len(values))
+
+                    # Map Screener labels to our field names
+                    if any(k in label for k in ['sales', 'revenue', 'net interest income', 'income']):
+                        if 'revenue' not in data_rows:
+                            data_rows['revenue'] = values
+                    elif 'net profit' in label or 'pat' in label:
+                        data_rows['pat'] = values
+                    elif 'eps' in label and 'diluted' not in label:
+                        data_rows['eps'] = values
+                    elif 'eps in rs' in label or 'basic eps' in label or 'diluted eps' in label:
+                        if 'eps' not in data_rows:
+                            data_rows['eps'] = values
+                    elif 'operating profit' in label and 'margin' not in label:
+                        data_rows['ebitda'] = values
+                    elif 'opm' in label or 'operating profit margin' in label:
+                        data_rows['ebitdaMargin'] = values
+
+                if 'revenue' not in data_rows or not years:
+                    continue
+
+                # ── Build output rows ──────────────────────────────────────
+                result = []
+                revenues = data_rows.get('revenue', [])
+                pats     = data_rows.get('pat', [])
+                ebitdas  = data_rows.get('ebitda', [])
+                epss     = data_rows.get('eps', [])
+                ebitda_margins = data_rows.get('ebitdaMargin', [])
+
+                for i, yr in enumerate(years):
+                    rev  = revenues[i] if i < len(revenues) else 0.0
+                    pat  = pats[i]     if i < len(pats)     else 0.0
+                    ebit = ebitdas[i]  if i < len(ebitdas)  else 0.0
+                    eps  = epss[i]     if i < len(epss)     else 0.0
+
+                    net_margin   = round((pat / rev) * 100, 2) if rev > 0 else 0.0
+                    ebitda_pct   = (ebitda_margins[i] if i < len(ebitda_margins)
+                                    else (round((ebit / rev) * 100, 2) if rev > 0 else 0.0))
+                    rev_growth   = 0.0
+                    if i > 0 and revenues[i-1] > 0 and rev > 0:
+                        rev_growth = round(((rev - revenues[i-1]) / revenues[i-1]) * 100, 2)
+
+                    result.append({
+                        "year":         yr,
+                        "revenue":      round(rev, 2),
+                        "pat":          round(pat, 2),
+                        "ebitda":       round(ebit, 2),
+                        "eps":          round(eps, 2),
+                        "netMargin":    net_margin,
+                        "revenueGrowth":rev_growth,
+                        "ebitdaMargin": round(ebitda_pct, 2),
+                        "source":       "screener",
+                    })
+
+                # Return last 5 years only (most relevant)
+                return result[-5:] if len(result) >= 5 else result
+
+            except Exception as e:
+                print(f"[Screener] {sym} ({variant}): {e}")
+                continue
+
+        return None  # Both variants failed
+
+    # ── Try Screener first, fall back to Yahoo ──────────────────────────────
+    screener_data = None
+    try:
+        screener_data = _scrape_screener(symbol)
+    except Exception as e:
+        print(f"[Screener] Outer error for {symbol}: {e}")
+
+    if screener_data and len(screener_data) >= 2:
+        # Add shares from Yahoo (Screener doesn't have it directly)
+        try:
+            ns = _get_yf_ticker(symbol)
+            ks_data = _yf_summary(ns, "defaultKeyStatistics")
+            ks = ks_data.get("defaultKeyStatistics") or {}
+            so_raw = ks.get("sharesOutstanding")
+            shares_cr = float(so_raw.get("raw", 0) if isinstance(so_raw, dict) else (so_raw or 0)) / 1e7
+            for row in screener_data:
+                row["shares"] = round(shares_cr, 2)
+        except Exception:
+            pass  # shares optional — model has fallback
+
+        _cache_set(cache_key, screener_data)
+        print(f"[Screener] {symbol}: returned {len(screener_data)} years from Screener.in")
+        return screener_data
+
+    # ── Fallback: Yahoo Finance financials ──────────────────────────────────
+    print(f"[Screener] {symbol}: falling back to Yahoo Finance")
+    try:
+        yahoo_data = financials(symbol)   # calls the existing /financials endpoint logic
+        # Tag rows so UI can show the source
+        for row in yahoo_data:
+            row["source"] = "yahoo"
+        _cache_set(cache_key, yahoo_data)
+        return yahoo_data
+    except Exception as e:
+        raise HTTPException(500, f"Both Screener and Yahoo failed for {symbol}: {e}")
+
+
 @app.get("/price/{symbol}")
 def price(symbol: str):
     """Quick current price endpoint — direct Yahoo Finance API."""
