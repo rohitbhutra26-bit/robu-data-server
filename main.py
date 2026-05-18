@@ -852,6 +852,134 @@ def historical_valuation(symbol: str):
     return result
 
 
+# ---------------------------------------------------------------------------
+# Sector peer map — curated Indian stocks by sector
+# ---------------------------------------------------------------------------
+_SECTOR_PEERS: dict[str, list[str]] = {
+    "Information Technology": ["TCS.NS","INFY.NS","WIPRO.NS","HCLTECH.NS","TECHM.NS","LTIM.NS","MPHASIS.NS","PERSISTENT.NS","COFORGE.NS"],
+    "Technology": ["TCS.NS","INFY.NS","WIPRO.NS","HCLTECH.NS","TECHM.NS","LTIM.NS","MPHASIS.NS","PERSISTENT.NS","COFORGE.NS"],
+    "Banking": ["HDFCBANK.NS","ICICIBANK.NS","KOTAKBANK.NS","AXISBANK.NS","SBIN.NS","INDUSINDBK.NS","FEDERALBNK.NS","BANDHANBNK.NS","AUBANK.NS"],
+    "Financial Services": ["HDFCBANK.NS","ICICIBANK.NS","KOTAKBANK.NS","AXISBANK.NS","SBIN.NS","BAJFINANCE.NS","BAJAJFINSV.NS","CHOLAFIN.NS"],
+    "NBFC": ["BAJFINANCE.NS","BAJAJFINSV.NS","CHOLAFIN.NS","MUTHOOTFIN.NS","MANAPPURAM.NS","HDFCAMC.NS"],
+    "FMCG": ["HINDUNILVR.NS","NESTLEIND.NS","BRITANNIA.NS","DABUR.NS","MARICO.NS","COLPAL.NS","ITC.NS","EMAMILTD.NS","GODREJCP.NS"],
+    "Consumer": ["TITAN.NS","TRENT.NS","NYKAA.NS","DMART.NS","BATA.NS","RELAXO.NS","VMART.NS"],
+    "Pharmaceuticals": ["SUNPHARMA.NS","DIVISLAB.NS","CIPLA.NS","DRREDDY.NS","AUROPHARMA.NS","TORNTPHARM.NS","ALKEM.NS","LALPATHLAB.NS"],
+    "Healthcare": ["SUNPHARMA.NS","DIVISLAB.NS","CIPLA.NS","DRREDDY.NS","AUROPHARMA.NS","TORNTPHARM.NS","ALKEM.NS"],
+    "Automobiles": ["TATAMOTORS.NS","MARUTI.NS","BAJAJ-AUTO.NS","EICHERMOT.NS","HEROMOTOCO.NS","MOTHERSON.NS","TVSMOTOR.NS","ASHOKLEY.NS"],
+    "Energy": ["RELIANCE.NS","ONGC.NS","BPCL.NS","IOC.NS","GAIL.NS","PETRONET.NS","MGL.NS"],
+    "Metals": ["TATASTEEL.NS","JSWSTEEL.NS","HINDALCO.NS","COALINDIA.NS","VEDL.NS","NMDC.NS","SAIL.NS","JINDALSTEL.NS"],
+    "Infrastructure": ["LT.NS","SIEMENS.NS","ABB.NS","HAVELLS.NS","BHARTIARTL.NS","ADANIPORTS.NS","IRCTC.NS"],
+    "Utilities": ["NTPC.NS","POWERGRID.NS","TATAPOWER.NS","TORNTPOWER.NS","ADANIGREEN.NS","CESC.NS"],
+    "Telecom": ["BHARTIARTL.NS","IDEA.NS","TATACOMM.NS","HFCL.NS"],
+    "Electronics": ["KAYNES.NS","DIXON.NS","AMBER.NS","SYRMA.NS","PG ELECTROPLAST.NS","BEL.NS"],
+    "Conglomerate": ["RELIANCE.NS","ADANIENT.NS","ITC.NS","LT.NS","TATAMOTORS.NS","M&M.NS"],
+    "Real Estate": ["DLF.NS","GODREJPROP.NS","PRESTIGE.NS","PHOENIXLTD.NS","OBEROI.NS","BRIGADE.NS"],
+}
+
+
+@app.get("/peers/{symbol}")
+def get_peers(symbol: str):
+    """
+    Return sector peers with key financial metrics.
+    Fetches metrics for up to 7 peers + the queried company itself.
+    Used by the Peer Compare view on the frontend.
+    """
+    symbol = symbol.upper().strip()
+    cache_key = f"peers:{symbol}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    ns = _get_yf_ticker(symbol)
+
+    # ── 1. Get sector for this symbol ─────────────────────────────────────
+    try:
+        profile_data = _yf_summary(ns, "summaryProfile,price,summaryDetail,defaultKeyStatistics,financialData")
+    except Exception as e:
+        raise HTTPException(502, f"Cannot fetch profile for {symbol}: {e}")
+
+    sector = (profile_data.get("summaryProfile") or {}).get("sector", "")
+    # Fallback: check our universe map
+    if not sector:
+        sector = (STOCK_UNIVERSE.get(symbol) or {}).get("sector", "")
+
+    # ── 2. Build peer list ────────────────────────────────────────────────
+    peer_ns_list = _SECTOR_PEERS.get(sector, [])
+    # Ensure self is included first; remove self from peers to avoid duplication
+    self_in_list = any(p.lower() == ns.lower() for p in peer_ns_list)
+    peers_only = [p for p in peer_ns_list if p.lower() != ns.lower()][:6]
+    all_symbols = [ns] + peers_only  # self first, then up to 6 peers
+
+    # ── 3. Extract metrics from a yf summary result ───────────────────────
+    def _extract_metrics(data: dict, sym_ns: str, is_self: bool) -> dict | None:
+        try:
+            pr  = data.get("price") or {}
+            ks  = data.get("defaultKeyStatistics") or {}
+            fd  = data.get("financialData") or {}
+            sd  = data.get("summaryDetail") or {}
+
+            def rv(d: dict, key: str):
+                v = d.get(key)
+                if isinstance(v, dict): return v.get("raw")
+                return v
+
+            name = rv(pr, "shortName") or rv(pr, "longName") or sym_ns.replace(".NS","").replace(".BO","")
+            ticker = sym_ns.replace(".NS","").replace(".BO","")
+
+            mktcap_raw = rv(pr, "marketCap") or 0
+            price_raw  = rv(pr, "regularMarketPrice") or 0
+
+            pe = rv(sd, "trailingPE") or rv(ks, "trailingPE") or rv(ks, "forwardPE")
+            pb = rv(ks, "priceToBook")
+            ev_ebitda = rv(ks, "enterpriseToEbitda")
+            rev_growth = (rv(fd, "revenueGrowth") or 0) * 100
+            net_margin = (rv(fd, "profitMargins") or 0) * 100
+            roe = (rv(fd, "returnOnEquity") or 0) * 100
+            de  = rv(fd, "debtToEquity")
+
+            # Sanity cap
+            if pe and (pe > 500 or pe < 0): pe = None
+            if pb and (pb > 100 or pb < 0): pb = None
+            if ev_ebitda and (ev_ebitda > 200 or ev_ebitda < 0): ev_ebitda = None
+
+            return {
+                "symbol": ticker,
+                "name": name,
+                "marketCap": round(mktcap_raw / 1e7, 0) if mktcap_raw else None,  # in ₹ Cr
+                "currentPrice": round(price_raw, 1) if price_raw else None,
+                "pe": round(pe, 1) if pe else None,
+                "pb": round(pb, 1) if pb else None,
+                "evEbitda": round(ev_ebitda, 1) if ev_ebitda else None,
+                "revenueGrowth": round(rev_growth, 1) if rev_growth else None,
+                "netMargin": round(net_margin, 1) if net_margin else None,
+                "roe": round(roe, 1) if roe else None,
+                "de": round(de, 1) if de else None,
+                "isSelf": is_self,
+            }
+        except Exception:
+            return None
+
+    # ── 4. Fetch all symbols ──────────────────────────────────────────────
+    results = []
+    for sym_ns in all_symbols:
+        is_self = sym_ns.lower() == ns.lower()
+        try:
+            if is_self:
+                data = profile_data  # already fetched
+            else:
+                time.sleep(0.25)  # small delay to avoid rate limiting
+                data = _yf_summary(sym_ns, "price,summaryDetail,defaultKeyStatistics,financialData")
+            row = _extract_metrics(data, sym_ns, is_self)
+            if row:
+                results.append(row)
+        except Exception:
+            pass  # skip peers that fail
+
+    result = {"sector": sector, "peers": results}
+    _cache_set(cache_key, result)
+    return result
+
+
 @app.get("/universe/size")
 def universe_size():
     return {"count": len(STOCK_UNIVERSE), "source": "NSE EQUITY_L.csv"}
