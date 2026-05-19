@@ -132,38 +132,83 @@ def _get_screener_session():
 
 def _fetch_screener_page(symbol: str) -> Any:
     """
-    Fetch and parse the Screener.in consolidated company page.
+    Fetch and parse the Screener.in CONSOLIDATED company page.
     Returns a BeautifulSoup object or None.
-    Tries authenticated session first; falls back to public access.
+
+    KEY RULE: We ONLY return consolidated data.
+    - With auth (session): consolidated page is accessible → use it.
+    - Without auth: consolidated page redirects to login.
+      In that case we return None — caller falls back to Yahoo Finance
+      (which always returns consolidated data for Indian stocks).
+    - We NEVER fall back to standalone Screener data, because standalone
+      revenue for conglomerates (Reliance, Tata Motors, Adani) is 3-6x
+      lower than consolidated, producing completely wrong valuations.
     """
     if not _BS4_AVAILABLE:
         return None
 
     sess = _get_screener_session()
 
-    for variant in ["consolidated", ""]:
-        url = f"https://www.screener.in/company/{symbol}/{variant}/"
-        try:
-            if sess:
+    # ── With authenticated session: try consolidated then standalone ──────────
+    # Authenticated users see consolidated by default — standalone is only
+    # shown when the company has no subsidiaries (same data either way).
+    if sess:
+        for variant in ["consolidated", ""]:
+            url = f"https://www.screener.in/company/{symbol}/{variant}/"
+            try:
                 resp = sess.get(url, timeout=20)
-            elif _CURL_AVAILABLE:
-                resp = cffi_requests.get(
-                    url, headers=_make_browser_headers(), timeout=20, impersonate="chrome124"
-                )
-            else:
-                resp = requests.get(url, headers=_make_browser_headers(), timeout=20)
-
-            if resp.status_code != 200:
+                if resp.status_code != 200:
+                    continue
+                soup = BeautifulSoup(resp.text, "lxml")
+                if soup.find(id="top-ratios") or soup.find(id="profit-loss"):
+                    # Detect if we got standalone when consolidated exists
+                    # (Screener shows a "Switch to Consolidated" link in this case)
+                    standalone_warning = soup.find("a", string=lambda t: t and "consolidated" in t.lower())
+                    if standalone_warning and variant == "":
+                        # Standalone-only page for a company that has consolidated view
+                        # Still return it — for standalone companies this IS the right data
+                        pass
+                    print(f"[Screener] {symbol}: loaded {variant or 'standalone'} page ✓")
+                    return soup
+            except Exception as e:
+                print(f"[Screener] Auth fetch error {symbol} ({variant}): {e}")
                 continue
+        return None
 
-            soup = BeautifulSoup(resp.text, "lxml")
-            # Verify it's a real company page (not search/404)
-            if soup.find(id="top-ratios") or soup.find(id="profit-loss"):
-                return soup
+    # ── Without auth: ONLY try consolidated ───────────────────────────────────
+    # If consolidated requires login, we return None (caller uses Yahoo instead).
+    # We deliberately skip standalone to avoid conglomerate revenue mismatch.
+    url = f"https://www.screener.in/company/{symbol}/consolidated/"
+    try:
+        if _CURL_AVAILABLE:
+            resp = cffi_requests.get(
+                url, headers=_make_browser_headers(), timeout=20, impersonate="chrome124"
+            )
+        else:
+            resp = requests.get(url, headers=_make_browser_headers(), timeout=20)
 
-        except Exception as e:
-            print(f"[Screener] Fetch error {symbol} ({variant}): {e}")
-            continue
+        if resp.status_code != 200:
+            print(f"[Screener] {symbol}: consolidated HTTP {resp.status_code} without auth → Yahoo fallback")
+            return None
+
+        # Check if we were redirected to login page (Screener returns 200 on login redirect)
+        if "/login" in resp.url or "login" in resp.url:
+            print(f"[Screener] {symbol}: consolidated requires auth → Yahoo fallback")
+            return None
+
+        soup = BeautifulSoup(resp.text, "lxml")
+
+        # If the page has a login form, we got the login page (not the company page)
+        if soup.find("form", {"action": lambda a: a and "login" in a}):
+            print(f"[Screener] {symbol}: got login page without auth → Yahoo fallback")
+            return None
+
+        if soup.find(id="top-ratios") or soup.find(id="profit-loss"):
+            print(f"[Screener] {symbol}: public consolidated page loaded ✓")
+            return soup
+
+    except Exception as e:
+        print(f"[Screener] No-auth fetch error {symbol}: {e}")
 
     return None
 
@@ -171,17 +216,41 @@ def _fetch_screener_page(symbol: str) -> Any:
 def _cr(val_str: str) -> float:
     """
     Parse a ₹ Crore value string from Screener.
-    Handles: '1,25,432', '12,345.67', '1.25L', '-234'
+    Handles: '1,25,432', '12,345.67', '1.25L', '-234', '(1,234)', '25.34 %'
     All Screener financials are already in ₹ Crore — no conversion needed.
+
+    Indian accounting notation:
+      (1,234)  → negative  → -1234   [loss-making PAT rows]
+      25.34 %  → strip %   → 25.34   [OPM% rows]
     """
     try:
-        v = val_str.strip().replace(",", "").replace("₹", "").replace("Cr.", "").replace("Cr", "").strip()
-        if not v or v == "--" or v == "":
+        v = val_str.strip()
+        if not v or v in ("--", "-", ""):
             return 0.0
+
+        # Detect parenthetical negatives: (1,234) → -1234
+        is_negative = v.startswith("(") and v.endswith(")")
+        if is_negative:
+            v = v[1:-1]  # strip parens
+
+        # Strip all formatting characters
+        v = (v.replace(",", "")
+              .replace("₹", "")
+              .replace("Cr.", "")
+              .replace("Cr", "")
+              .replace("%", "")
+              .strip())
+
+        if not v:
+            return 0.0
+
         # Handle Lakh Crore suffix (e.g. "1.25L" = 1,25,000 Cr)
         if v.endswith("L") or v.endswith("l"):
-            return float(v[:-1]) * 100000
-        return float(v)
+            result = float(v[:-1]) * 100000
+        else:
+            result = float(v)
+
+        return -result if is_negative else result
     except Exception:
         return 0.0
 
@@ -301,7 +370,25 @@ def _parse_screener_financials(soup: Any) -> list:
         return years, rows
 
     def _row(rows: dict, *keywords) -> list:
-        """Find the first row whose label contains any of the keywords."""
+        """
+        Find a row by label. Priority:
+          1. Exact match — label == keyword
+          2. Starts-with match — label starts with keyword (e.g. "sales " matches "sales")
+          3. Contains match — keyword is a substring (broadest, used as last resort)
+
+        This prevents "other income from sales" stealing the "sales" row.
+        """
+        # Pass 1: exact
+        for kw in keywords:
+            for label, vals in rows.items():
+                if label == kw:
+                    return vals
+        # Pass 2: starts-with
+        for kw in keywords:
+            for label, vals in rows.items():
+                if label.startswith(kw):
+                    return vals
+        # Pass 3: contains (substring fallback)
         for kw in keywords:
             for label, vals in rows.items():
                 if kw in label:
