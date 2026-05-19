@@ -143,9 +143,22 @@ def _fetch_screener_page(symbol: str) -> Any:
     - We NEVER fall back to standalone Screener data, because standalone
       revenue for conglomerates (Reliance, Tata Motors, Adani) is 3-6x
       lower than consolidated, producing completely wrong valuations.
+
+    BSE-only stocks: Screener.in uses the same symbol as NSE for dual-listed stocks.
+    For BSE-only stocks, it uses the company's BSE ticker. We try the symbol as-is,
+    and also check the STOCK_UNIVERSE for a known BSE ticker as fallback.
     """
     if not _BS4_AVAILABLE:
         return None
+
+    # Build list of symbol candidates to try on Screener
+    # For most stocks the NSE symbol works. For BSE-only stocks, Screener uses
+    # the same symbol or sometimes the BSE code. We try both.
+    candidates = [symbol]
+    bse_info = STOCK_UNIVERSE.get(symbol, {})
+    bse_code = bse_info.get("bse_code") or bse_info.get("bseCode")
+    if bse_code and str(bse_code) != symbol:
+        candidates.append(str(bse_code))
 
     sess = _get_screener_session()
 
@@ -153,62 +166,61 @@ def _fetch_screener_page(symbol: str) -> Any:
     # Authenticated users see consolidated by default — standalone is only
     # shown when the company has no subsidiaries (same data either way).
     if sess:
-        for variant in ["consolidated", ""]:
-            url = f"https://www.screener.in/company/{symbol}/{variant}/"
-            try:
-                resp = sess.get(url, timeout=20)
-                if resp.status_code != 200:
+        for sym_candidate in candidates:
+            for variant in ["consolidated", ""]:
+                url = f"https://www.screener.in/company/{sym_candidate}/{variant}/"
+                try:
+                    resp = sess.get(url, timeout=20)
+                    if resp.status_code == 404:
+                        break  # This symbol doesn't exist on Screener, try next candidate
+                    if resp.status_code != 200:
+                        continue
+                    soup = BeautifulSoup(resp.text, "lxml")
+                    if soup.find(id="top-ratios") or soup.find(id="profit-loss"):
+                        print(f"[Screener] {symbol}→{sym_candidate}: loaded {variant or 'standalone'} page ✓")
+                        return soup
+                except Exception as e:
+                    print(f"[Screener] Auth fetch error {sym_candidate} ({variant}): {e}")
                     continue
-                soup = BeautifulSoup(resp.text, "lxml")
-                if soup.find(id="top-ratios") or soup.find(id="profit-loss"):
-                    # Detect if we got standalone when consolidated exists
-                    # (Screener shows a "Switch to Consolidated" link in this case)
-                    standalone_warning = soup.find("a", string=lambda t: t and "consolidated" in t.lower())
-                    if standalone_warning and variant == "":
-                        # Standalone-only page for a company that has consolidated view
-                        # Still return it — for standalone companies this IS the right data
-                        pass
-                    print(f"[Screener] {symbol}: loaded {variant or 'standalone'} page ✓")
-                    return soup
-            except Exception as e:
-                print(f"[Screener] Auth fetch error {symbol} ({variant}): {e}")
-                continue
         return None
 
     # ── Without auth: ONLY try consolidated ───────────────────────────────────
     # If consolidated requires login, we return None (caller uses Yahoo instead).
     # We deliberately skip standalone to avoid conglomerate revenue mismatch.
-    url = f"https://www.screener.in/company/{symbol}/consolidated/"
-    try:
-        if _CURL_AVAILABLE:
-            resp = cffi_requests.get(
-                url, headers=_make_browser_headers(), timeout=20, impersonate="chrome124"
-            )
-        else:
-            resp = requests.get(url, headers=_make_browser_headers(), timeout=20)
+    for sym_candidate in candidates:
+        url = f"https://www.screener.in/company/{sym_candidate}/consolidated/"
+        try:
+            if _CURL_AVAILABLE:
+                resp = cffi_requests.get(
+                    url, headers=_make_browser_headers(), timeout=20, impersonate="chrome124"
+                )
+            else:
+                resp = requests.get(url, headers=_make_browser_headers(), timeout=20)
 
-        if resp.status_code != 200:
-            print(f"[Screener] {symbol}: consolidated HTTP {resp.status_code} without auth → Yahoo fallback")
-            return None
+            if resp.status_code == 404:
+                continue  # Try next candidate
+            if resp.status_code != 200:
+                print(f"[Screener] {sym_candidate}: consolidated HTTP {resp.status_code} without auth → Yahoo fallback")
+                continue
 
-        # Check if we were redirected to login page (Screener returns 200 on login redirect)
-        if "/login" in resp.url or "login" in resp.url:
-            print(f"[Screener] {symbol}: consolidated requires auth → Yahoo fallback")
-            return None
+            # Check if we were redirected to login page (Screener returns 200 on login redirect)
+            if "/login" in resp.url or "login" in resp.url:
+                print(f"[Screener] {sym_candidate}: consolidated requires auth → Yahoo fallback")
+                return None  # Auth required — no point trying other candidates
 
-        soup = BeautifulSoup(resp.text, "lxml")
+            soup = BeautifulSoup(resp.text, "lxml")
 
-        # If the page has a login form, we got the login page (not the company page)
-        if soup.find("form", {"action": lambda a: a and "login" in a}):
-            print(f"[Screener] {symbol}: got login page without auth → Yahoo fallback")
-            return None
+            # If the page has a login form, we got the login page (not the company page)
+            if soup.find("form", {"action": lambda a: a and "login" in a}):
+                print(f"[Screener] {sym_candidate}: got login page without auth → Yahoo fallback")
+                return None  # Auth required globally
 
-        if soup.find(id="top-ratios") or soup.find(id="profit-loss"):
-            print(f"[Screener] {symbol}: public consolidated page loaded ✓")
-            return soup
+            if soup.find(id="top-ratios") or soup.find(id="profit-loss"):
+                print(f"[Screener] {symbol}→{sym_candidate}: public consolidated page loaded ✓")
+                return soup
 
-    except Exception as e:
-        print(f"[Screener] No-auth fetch error {symbol}: {e}")
+        except Exception as e:
+            print(f"[Screener] No-auth fetch error {sym_candidate}: {e}")
 
     return None
 
@@ -626,6 +638,63 @@ def _get_yf_ticker(symbol: str) -> str:
     return f"{symbol}.NS"
 
 
+# In-memory exchange resolution cache: symbol → ("SYMBOL.NS" | "SYMBOL.BO", "NSE" | "BSE")
+# This avoids the extra Yahoo probe on every request after the first lookup.
+_exchange_cache: dict[str, tuple[str, str]] = {}
+
+
+def _resolve_ticker(symbol: str) -> tuple[str, str]:
+    """
+    Return (yf_ticker, exchange) for a symbol.
+    If the .NS ticker has no price data, automatically retries with .BO.
+    This fixes BSE-only stocks (e.g. RATNABHUMI, many SME / small caps).
+
+    Result is cached in _exchange_cache so the extra probe only happens once.
+    Returns: (ticker_string, "NSE" | "BSE")
+    """
+    if symbol in _exchange_cache:
+        return _exchange_cache[symbol]
+
+    initial = _get_yf_ticker(symbol)
+    # If already known as BSE from universe, return early
+    info = STOCK_UNIVERSE.get(symbol, {})
+    if info.get("yf_ticker", "").endswith(".BO") or symbol.isdigit():
+        _exchange_cache[symbol] = (initial, "BSE")
+        return initial, "BSE"
+
+    # Check if the .NS ticker actually has price data
+    try:
+        ns_data = _yf_summary(initial, "price")
+        pr = ns_data.get("price") or {}
+        price_val = pr.get("regularMarketPrice")
+        if isinstance(price_val, dict):
+            price_val = price_val.get("raw")
+        if price_val and float(price_val) > 0:
+            _exchange_cache[symbol] = (initial, "NSE")
+            return initial, "NSE"
+    except Exception:
+        pass
+
+    # .NS had no data → try .BO (BSE-only listed stock)
+    bo_ticker = f"{symbol}.BO"
+    try:
+        bo_data = _yf_summary(bo_ticker, "price")
+        pr = bo_data.get("price") or {}
+        price_val = pr.get("regularMarketPrice")
+        if isinstance(price_val, dict):
+            price_val = price_val.get("raw")
+        if price_val and float(price_val) > 0:
+            print(f"[ticker] {symbol}: .NS had no data → resolved to BSE (.BO)")
+            _exchange_cache[symbol] = (bo_ticker, "BSE")
+            return bo_ticker, "BSE"
+    except Exception:
+        pass
+
+    # Both failed — return .NS as default (company endpoint will raise 404)
+    _exchange_cache[symbol] = (initial, "NSE")
+    return initial, "NSE"
+
+
 # Load universe on startup
 _load_nse_universe()
 _load_bse_universe()
@@ -892,7 +961,7 @@ def company(symbol: str):
     if cached is not None:
         return cached
 
-    ns = _get_yf_ticker(symbol)
+    ns, exchange = _resolve_ticker(symbol)
     modules = "financialData,defaultKeyStatistics,assetProfile,summaryDetail,price"
     data = _yf_summary(ns, modules)
 
@@ -926,11 +995,21 @@ def company(symbol: str):
     ear_g   = rv(fd, "earningsGrowth")
     d2e     = rv(fd, "debtToEquity")
 
+    # Use Yahoo's exchangeName if available, otherwise our resolved exchange
+    yf_exchange = rv(pr, "exchangeName") or rv(pr, "exchange") or ""
+    if "NSE" in yf_exchange.upper():
+        resolved_exchange = "NSE"
+    elif "BSE" in yf_exchange.upper() or "BOM" in yf_exchange.upper():
+        resolved_exchange = "BSE"
+    else:
+        resolved_exchange = exchange  # from _resolve_ticker
+
     result = {
         "symbol": symbol,
         "name": rv(pr, "longName") or rv(pr, "shortName") or stock_meta.get("name", symbol),
         "sector": ap.get("sector") or stock_meta.get("sector", "Unknown"),
         "industry": ap.get("industry", ""),
+        "exchange": resolved_exchange,
         "currentPrice": price_val,
         "previousClose": prev_close,
         "change": change,
@@ -966,7 +1045,7 @@ def financials(symbol: str):
     if cached is not None:
         return cached
 
-    ns = _get_yf_ticker(symbol)
+    ns, _exch = _resolve_ticker(symbol)
     # financialData gives TTM figures — used to fill FY gap when annual stmts lag
     data = _yf_summary(ns, "incomeStatementHistory,defaultKeyStatistics,financialData")
     stmts = (data.get("incomeStatementHistory") or {}).get("incomeStatementHistory") or []
@@ -1113,7 +1192,7 @@ def company_v2(symbol: str):
         return cached
 
     # ── Always fetch live price from Yahoo — it's reliable for this ──────────
-    ns   = _get_yf_ticker(symbol)
+    ns, exchange = _resolve_ticker(symbol)
     data = _yf_summary(ns, "price,defaultKeyStatistics,summaryDetail,assetProfile,financialData")
 
     pr = data.get("price", {})
@@ -1143,6 +1222,13 @@ def company_v2(symbol: str):
     if price_val == 0:
         raise HTTPException(404, f"No price data for {ns}")
 
+    # Resolve final exchange label
+    yf_exchange = rv(pr, "exchangeName") or rv(pr, "exchange") or ""
+    if "NSE" in str(yf_exchange).upper():
+        exchange = "NSE"
+    elif "BSE" in str(yf_exchange).upper() or "BOM" in str(yf_exchange).upper():
+        exchange = "BSE"
+
     stock_meta = STOCK_UNIVERSE.get(symbol, {})
 
     # Build base result from Yahoo (always available)
@@ -1151,6 +1237,7 @@ def company_v2(symbol: str):
         "name":           rv(pr, "longName") or rv(pr, "shortName") or stock_meta.get("name", symbol),
         "sector":         ap.get("sector") or stock_meta.get("sector", "Unknown"),
         "industry":       ap.get("industry", ""),
+        "exchange":       exchange,
         "currentPrice":   price_val,
         "previousClose":  prev_close,
         "change":         change,
@@ -1301,7 +1388,7 @@ def historical_valuation(symbol: str):
     if cached is not None:
         return cached
 
-    ns = _get_yf_ticker(symbol)
+    ns, _exch = _resolve_ticker(symbol)
     _ensure_yahoo()
     if not _YF_SESSION_OBJ or not _YF_CRUMB:
         raise HTTPException(503, "Yahoo Finance session unavailable")
@@ -1449,9 +1536,126 @@ _SECTOR_PEERS: dict[str, list[str]] = {
     "Infrastructure": ["LT.NS","SIEMENS.NS","ABB.NS","HAVELLS.NS","BHARTIARTL.NS","ADANIPORTS.NS","IRCTC.NS"],
     "Utilities": ["NTPC.NS","POWERGRID.NS","TATAPOWER.NS","TORNTPOWER.NS","ADANIGREEN.NS","CESC.NS"],
     "Telecom": ["BHARTIARTL.NS","IDEA.NS","TATACOMM.NS","HFCL.NS"],
-    "Electronics": ["KAYNES.NS","DIXON.NS","AMBER.NS","SYRMA.NS","PG ELECTROPLAST.NS","BEL.NS"],
+    "Electronics": ["KAYNES.NS","DIXON.NS","AMBER.NS","SYRMA.NS","BEL.NS"],
     "Conglomerate": ["RELIANCE.NS","ADANIENT.NS","ITC.NS","LT.NS","TATAMOTORS.NS","M&M.NS"],
     "Real Estate": ["DLF.NS","GODREJPROP.NS","PRESTIGE.NS","PHOENIXLTD.NS","OBEROI.NS","BRIGADE.NS"],
+}
+
+# ---------------------------------------------------------------------------
+# Industry-level peer map (more specific than sector — fixes broker/bank mixing)
+# Yahoo Finance returns an "industry" field inside summaryProfile that is much
+# more granular than "sector". For example Angel One's sector="Financial Services"
+# but industry="Capital Markets". We check industry FIRST, then fall back to sector.
+# ---------------------------------------------------------------------------
+_INDUSTRY_PEERS: dict[str, list[str]] = {
+    # ── Brokers / Capital Markets ──────────────────────────────────────────
+    "Capital Markets":        ["ANGELONE.NS","5PAISA.NS","MOFSL.NS","IIFLSEC.NS","ICICIPRULI.NS","HDFCSEC.NS","ZERODHA.NS"],
+    "Investment Banking":     ["ANGELONE.NS","5PAISA.NS","MOFSL.NS","IIFLSEC.NS","ICICIPRULI.NS","HDFCSEC.NS"],
+    "Financial Data":         ["ANGELONE.NS","5PAISA.NS","MOFSL.NS","IIFLSEC.NS","CAMS.NS","KFINTECH.NS"],
+
+    # ── Banks ──────────────────────────────────────────────────────────────
+    "Banks—Regional":         ["HDFCBANK.NS","ICICIBANK.NS","KOTAKBANK.NS","AXISBANK.NS","SBIN.NS","INDUSINDBK.NS","FEDERALBNK.NS","BANDHANBNK.NS","AUBANK.NS"],
+    "Banks—Diversified":      ["HDFCBANK.NS","ICICIBANK.NS","KOTAKBANK.NS","AXISBANK.NS","SBIN.NS","INDUSINDBK.NS","FEDERALBNK.NS","BANDHANBNK.NS","AUBANK.NS"],
+    "Banks - Regional":       ["HDFCBANK.NS","ICICIBANK.NS","KOTAKBANK.NS","AXISBANK.NS","SBIN.NS","INDUSINDBK.NS","FEDERALBNK.NS","BANDHANBNK.NS","AUBANK.NS"],
+    "Banks - Diversified":    ["HDFCBANK.NS","ICICIBANK.NS","KOTAKBANK.NS","AXISBANK.NS","SBIN.NS","INDUSINDBK.NS","FEDERALBNK.NS","BANDHANBNK.NS","AUBANK.NS"],
+
+    # ── NBFCs / Consumer Finance ───────────────────────────────────────────
+    "Consumer Finance":       ["BAJFINANCE.NS","CHOLAFIN.NS","MUTHOOTFIN.NS","MANAPPURAM.NS","MOTHERSON.NS","SHRIRAMFIN.NS","M&MFIN.NS"],
+    "Specialty Finance":      ["BAJFINANCE.NS","CHOLAFIN.NS","MUTHOOTFIN.NS","MANAPPURAM.NS","SHRIRAMFIN.NS","M&MFIN.NS"],
+    "Credit Services":        ["BAJFINANCE.NS","CHOLAFIN.NS","MUTHOOTFIN.NS","MANAPPURAM.NS","SHRIRAMFIN.NS"],
+
+    # ── Insurance ──────────────────────────────────────────────────────────
+    "Insurance—Life":         ["LICI.NS","SBILIFE.NS","HDFCLIFE.NS","MAXLIFE.NS","IPRU.NS","ABSLAMC.NS"],
+    "Insurance—Diversified":  ["LICI.NS","SBILIFE.NS","HDFCLIFE.NS","GICRE.NS","NIACL.NS","STARHEALTH.NS"],
+    "Insurance - Life":       ["LICI.NS","SBILIFE.NS","HDFCLIFE.NS","MAXLIFE.NS"],
+    "Insurance - Diversified":["LICI.NS","SBILIFE.NS","HDFCLIFE.NS","GICRE.NS","NIACL.NS","STARHEALTH.NS"],
+
+    # ── Asset Management ───────────────────────────────────────────────────
+    "Asset Management":       ["HDFCAMC.NS","NIPPONLIFE.NS","ABSLAMC.NS","UTIAMC.NS","CAMS.NS","KFINTECH.NS"],
+
+    # ── Software / IT Services ────────────────────────────────────────────
+    "Information Technology Services": ["TCS.NS","INFY.NS","WIPRO.NS","HCLTECH.NS","TECHM.NS","LTIM.NS","MPHASIS.NS","PERSISTENT.NS","COFORGE.NS"],
+    "Software—Application":   ["TCS.NS","INFY.NS","WIPRO.NS","HCLTECH.NS","TECHM.NS","LTIM.NS","MPHASIS.NS","PERSISTENT.NS","COFORGE.NS"],
+    "Software—Infrastructure": ["TCS.NS","INFY.NS","WIPRO.NS","HCLTECH.NS","TECHM.NS","LTIM.NS","MPHASIS.NS"],
+    "Software - Application": ["TCS.NS","INFY.NS","WIPRO.NS","HCLTECH.NS","TECHM.NS","LTIM.NS","MPHASIS.NS","PERSISTENT.NS","COFORGE.NS"],
+    "IT Services & Consulting": ["TCS.NS","INFY.NS","WIPRO.NS","HCLTECH.NS","TECHM.NS","LTIM.NS","MPHASIS.NS","PERSISTENT.NS","COFORGE.NS"],
+
+    # ── Pharma sub-types ──────────────────────────────────────────────────
+    "Drug Manufacturers—General": ["SUNPHARMA.NS","CIPLA.NS","DRREDDY.NS","AUROPHARMA.NS","TORNTPHARM.NS","ALKEM.NS","ZYDUSLIFE.NS"],
+    "Drug Manufacturers—Specialty": ["DIVISLAB.NS","DIVI.NS","LAURUS.NS","GRANULES.NS","NATPHARMA.NS"],
+    "Pharmaceutical Retailers": ["SUNPHARMA.NS","CIPLA.NS","DRREDDY.NS","AUROPHARMA.NS","TORNTPHARM.NS","ALKEM.NS"],
+    "Diagnostics & Research": ["LALPATHLAB.NS","METROPOLIS.NS","THYROCARE.NS","KRSNAA.NS"],
+
+    # ── Auto sub-types ────────────────────────────────────────────────────
+    "Auto Manufacturers":     ["TATAMOTORS.NS","MARUTI.NS","M&M.NS","BAJAJ-AUTO.NS","EICHERMOT.NS","HEROMOTOCO.NS","TVSMOTOR.NS"],
+    "Auto Parts":             ["MOTHERSON.NS","BOSCHLTD.NS","BHARATFORG.NS","APOLLOTYRE.NS","MRF.NS","BALKRISIND.NS"],
+
+    # ── Oil & Gas ─────────────────────────────────────────────────────────
+    "Oil & Gas Integrated":   ["RELIANCE.NS","ONGC.NS","BPCL.NS","IOC.NS","GAIL.NS"],
+    "Oil & Gas E&P":          ["ONGC.NS","OIL.NS","CAIRNIND.NS"],
+    "Oil & Gas Refining":     ["BPCL.NS","IOC.NS","MRPL.NS","HPCL.NS"],
+
+    # ── Steel / Metals ────────────────────────────────────────────────────
+    "Steel":                  ["TATASTEEL.NS","JSWSTEEL.NS","SAIL.NS","JINDALSTEL.NS","NMDC.NS"],
+    "Aluminum":               ["HINDALCO.NS","NALCO.NS","VEDL.NS"],
+    "Other Industrial Metals": ["TATASTEEL.NS","JSWSTEEL.NS","HINDALCO.NS","VEDL.NS","NMDC.NS"],
+
+    # ── Real Estate ───────────────────────────────────────────────────────
+    "Real Estate—Development": ["DLF.NS","GODREJPROP.NS","PRESTIGE.NS","PHOENIXLTD.NS","OBEROI.NS","BRIGADE.NS","MAHINDRAP.NS"],
+    "Real Estate - Development": ["DLF.NS","GODREJPROP.NS","PRESTIGE.NS","PHOENIXLTD.NS","OBEROI.NS","BRIGADE.NS"],
+    "REIT—Diversified":       ["EMBASSY.NS","MINDSPACEREIT.NS","NEXUS.NS"],
+
+    # ── Utilities ─────────────────────────────────────────────────────────
+    "Utilities—Regulated Electric": ["NTPC.NS","POWERGRID.NS","TATAPOWER.NS","TORNTPOWER.NS","ADANIGREEN.NS","CESC.NS"],
+    "Utilities—Renewable":    ["ADANIGREEN.NS","GREENKO.NS","JSPL.NS","TATAPOWER.NS"],
+
+    # ── Telecom ───────────────────────────────────────────────────────────
+    "Telecom Services":       ["BHARTIARTL.NS","IDEA.NS","TATACOMM.NS","HFCL.NS"],
+
+    # ── FMCG / Consumer Staples ───────────────────────────────────────────
+    "Household & Personal Products": ["HINDUNILVR.NS","DABUR.NS","MARICO.NS","GODREJCP.NS","COLPAL.NS","EMAMILTD.NS"],
+    "Packaged Foods":         ["NESTLEIND.NS","BRITANNIA.NS","TATACONSUM.NS","VARUNBEV.NS","VBL.NS"],
+
+    # ── Retail / Consumer Discretionary ───────────────────────────────────
+    "Specialty Retail":       ["TITAN.NS","TRENT.NS","NYKAA.NS","DMART.NS","BATA.NS","RELAXO.NS","VMART.NS"],
+    "Department Stores":      ["DMART.NS","TRENT.NS","VMART.NS","SHOPPERSSTOP.NS"],
+
+    # ── Cement ────────────────────────────────────────────────────────────
+    "Building Materials":     ["ULTRACEMCO.NS","AMBUJACEM.NS","ACCLTD.NS","SHREECEM.NS","RAMCOCEM.NS","JKCEMENT.NS"],
+
+    # ── Chemicals ─────────────────────────────────────────────────────────
+    "Specialty Chemicals":    ["PIDILITIND.NS","AAVAS.NS","NAVINFLUOR.NS","DEEPAKFERT.NS","ATUL.NS","TATACHEM.NS","VINATI.NS"],
+    "Agricultural Inputs":    ["PIIND.NS","BAYER.NS","RALLIS.NS","DHANUKA.NS"],
+
+    # ── Capital Goods / Industrials ───────────────────────────────────────
+    "Electrical Equipment":   ["SIEMENS.NS","ABB.NS","HAVELLS.NS","POLYCAB.NS","KEI.NS"],
+    "Industrial Machinery":   ["LT.NS","BHEL.NS","THERMAX.NS","CUMMINS.NS"],
+    "Engineering & Construction": ["LT.NS","NCC.NS","KEC.NS","IRCON.NS","RVNL.NS"],
+}
+
+# Symbol-level overrides: if Yahoo Finance industry/sector is wrong for a specific
+# stock, force it into the right peer group. Key = NSE symbol (no .NS suffix).
+_SYMBOL_PEER_OVERRIDE: dict[str, list[str]] = {
+    "ANGELONE":  ["ANGELONE.NS","5PAISA.NS","MOFSL.NS","IIFLSEC.NS","HDFCSEC.NS","KFINTECH.NS","CAMS.NS"],
+    "5PAISA":    ["ANGELONE.NS","5PAISA.NS","MOFSL.NS","IIFLSEC.NS","HDFCSEC.NS"],
+    "MOFSL":     ["ANGELONE.NS","5PAISA.NS","MOFSL.NS","IIFLSEC.NS","HDFCSEC.NS","ICICIPRULI.NS"],
+    "IIFLSEC":   ["ANGELONE.NS","5PAISA.NS","MOFSL.NS","IIFLSEC.NS","HDFCSEC.NS"],
+    "HDFCSEC":   ["ANGELONE.NS","5PAISA.NS","MOFSL.NS","IIFLSEC.NS","HDFCSEC.NS"],
+    "CAMS":      ["CAMS.NS","KFINTECH.NS","CDSL.NS","NSDL.NS","HDFCAMC.NS","NIPPONLIFE.NS"],
+    "KFINTECH":  ["CAMS.NS","KFINTECH.NS","CDSL.NS","NSDL.NS","HDFCAMC.NS","NIPPONLIFE.NS"],
+    "CDSL":      ["CDSL.NS","NSDL.NS","CAMS.NS","KFINTECH.NS","ANGELONE.NS","5PAISA.NS"],
+    "HDFCAMC":   ["HDFCAMC.NS","NIPPONLIFE.NS","ABSLAMC.NS","UTIAMC.NS","MOFSL.NS","IIFLSEC.NS"],
+    "NIPPONLIFE": ["HDFCAMC.NS","NIPPONLIFE.NS","ABSLAMC.NS","UTIAMC.NS"],
+    "SBILIFE":   ["LICI.NS","SBILIFE.NS","HDFCLIFE.NS","ICICIPRULI.NS","STARHEALTH.NS","NIACL.NS"],
+    "HDFCLIFE":  ["LICI.NS","SBILIFE.NS","HDFCLIFE.NS","ICICIPRULI.NS","STARHEALTH.NS"],
+    "ICICIPRULI": ["LICI.NS","SBILIFE.NS","HDFCLIFE.NS","ICICIPRULI.NS","STARHEALTH.NS"],
+    "LICI":      ["LICI.NS","SBILIFE.NS","HDFCLIFE.NS","ICICIPRULI.NS","GICRE.NS"],
+    "STARHEALTH": ["STARHEALTH.NS","NIACL.NS","GICRE.NS","LICI.NS","SBILIFE.NS"],
+    "MUTHOOTFIN": ["MUTHOOTFIN.NS","MANAPPURAM.NS","CHOLAFIN.NS","BAJFINANCE.NS","SHRIRAMFIN.NS"],
+    "MANAPPURAM": ["MUTHOOTFIN.NS","MANAPPURAM.NS","CHOLAFIN.NS","BAJFINANCE.NS","SHRIRAMFIN.NS"],
+    "SHRIRAMFIN": ["SHRIRAMFIN.NS","BAJFINANCE.NS","CHOLAFIN.NS","M&MFIN.NS","MUTHOOTFIN.NS"],
+    "M&MFIN":    ["M&MFIN.NS","SHRIRAMFIN.NS","CHOLAFIN.NS","BAJFINANCE.NS","MUTHOOTFIN.NS"],
+    "CHOLAFIN":  ["CHOLAFIN.NS","BAJFINANCE.NS","M&MFIN.NS","SHRIRAMFIN.NS","MUTHOOTFIN.NS"],
 }
 
 
@@ -1468,7 +1672,7 @@ def get_peers(symbol: str):
     if cached is not None:
         return cached
 
-    ns = _get_yf_ticker(symbol)
+    ns, _exch = _resolve_ticker(symbol)
 
     # ── 1. Get sector for this symbol ─────────────────────────────────────
     try:
@@ -1476,16 +1680,27 @@ def get_peers(symbol: str):
     except Exception as e:
         raise HTTPException(502, f"Cannot fetch profile for {symbol}: {e}")
 
-    sector = (profile_data.get("summaryProfile") or {}).get("sector", "")
+    sector   = (profile_data.get("summaryProfile") or {}).get("sector", "")
+    industry = (profile_data.get("summaryProfile") or {}).get("industry", "")
     # Fallback: check our universe map
     if not sector:
         sector = (STOCK_UNIVERSE.get(symbol) or {}).get("sector", "")
 
     # ── 2. Build peer list ────────────────────────────────────────────────
-    peer_ns_list = _SECTOR_PEERS.get(sector, [])
+    # Priority: symbol override > industry-level > sector-level
+    bare = symbol.replace(".NS","").replace(".BO","")
+    if bare in _SYMBOL_PEER_OVERRIDE:
+        peer_ns_list = _SYMBOL_PEER_OVERRIDE[bare]
+        print(f"[peers] {symbol}: using symbol override → {bare}")
+    elif industry and industry in _INDUSTRY_PEERS:
+        peer_ns_list = _INDUSTRY_PEERS[industry]
+        print(f"[peers] {symbol}: industry='{industry}' → {len(peer_ns_list)} peers")
+    else:
+        peer_ns_list = _SECTOR_PEERS.get(sector, [])
+        print(f"[peers] {symbol}: sector='{sector}' (industry='{industry}' not mapped)")
+
     # Ensure self is included first; remove self from peers to avoid duplication
-    self_in_list = any(p.lower() == ns.lower() for p in peer_ns_list)
-    peers_only = [p for p in peer_ns_list if p.lower() != ns.lower()][:6]
+    peers_only = [p for p in peer_ns_list if p.replace(".NS","").replace(".BO","").lower() != bare.lower()][:6]
     all_symbols = [ns] + peers_only  # self first, then up to 6 peers
 
     # ── 3. Extract metrics from a yf summary result ───────────────────────
@@ -1553,7 +1768,7 @@ def get_peers(symbol: str):
         except Exception:
             pass  # skip peers that fail
 
-    result = {"sector": sector, "peers": results}
+    result = {"sector": sector, "industry": industry, "peers": results}
     _cache_set(cache_key, result)
     return result
 
