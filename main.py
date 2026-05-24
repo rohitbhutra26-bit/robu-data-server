@@ -1633,30 +1633,136 @@ _INDUSTRY_PEERS: dict[str, list[str]] = {
     "Engineering & Construction": ["LT.NS","NCC.NS","KEC.NS","IRCON.NS","RVNL.NS"],
 }
 
-# Symbol-level overrides: if Yahoo Finance industry/sector is wrong for a specific
-# stock, force it into the right peer group. Key = NSE symbol (no .NS suffix).
+# Symbol-level overrides — verified NSE-listed peers only.
+# Groww, Zerodha, Kotak Securities = private/unlisted → excluded.
+# ICICIPRULI = insurance (not ICICI Securities which is ISEC).
 _SYMBOL_PEER_OVERRIDE: dict[str, list[str]] = {
-    "ANGELONE":  ["ANGELONE.NS","5PAISA.NS","MOFSL.NS","IIFLSEC.NS","HDFCSEC.NS","KFINTECH.NS","CAMS.NS"],
-    "5PAISA":    ["ANGELONE.NS","5PAISA.NS","MOFSL.NS","IIFLSEC.NS","HDFCSEC.NS"],
-    "MOFSL":     ["ANGELONE.NS","5PAISA.NS","MOFSL.NS","IIFLSEC.NS","HDFCSEC.NS","ICICIPRULI.NS"],
-    "IIFLSEC":   ["ANGELONE.NS","5PAISA.NS","MOFSL.NS","IIFLSEC.NS","HDFCSEC.NS"],
-    "HDFCSEC":   ["ANGELONE.NS","5PAISA.NS","MOFSL.NS","IIFLSEC.NS","HDFCSEC.NS"],
-    "CAMS":      ["CAMS.NS","KFINTECH.NS","CDSL.NS","NSDL.NS","HDFCAMC.NS","NIPPONLIFE.NS"],
-    "KFINTECH":  ["CAMS.NS","KFINTECH.NS","CDSL.NS","NSDL.NS","HDFCAMC.NS","NIPPONLIFE.NS"],
-    "CDSL":      ["CDSL.NS","NSDL.NS","CAMS.NS","KFINTECH.NS","ANGELONE.NS","5PAISA.NS"],
-    "HDFCAMC":   ["HDFCAMC.NS","NIPPONLIFE.NS","ABSLAMC.NS","UTIAMC.NS","MOFSL.NS","IIFLSEC.NS"],
-    "NIPPONLIFE": ["HDFCAMC.NS","NIPPONLIFE.NS","ABSLAMC.NS","UTIAMC.NS"],
-    "SBILIFE":   ["LICI.NS","SBILIFE.NS","HDFCLIFE.NS","ICICIPRULI.NS","STARHEALTH.NS","NIACL.NS"],
-    "HDFCLIFE":  ["LICI.NS","SBILIFE.NS","HDFCLIFE.NS","ICICIPRULI.NS","STARHEALTH.NS"],
-    "ICICIPRULI": ["LICI.NS","SBILIFE.NS","HDFCLIFE.NS","ICICIPRULI.NS","STARHEALTH.NS"],
-    "LICI":      ["LICI.NS","SBILIFE.NS","HDFCLIFE.NS","ICICIPRULI.NS","GICRE.NS"],
-    "STARHEALTH": ["STARHEALTH.NS","NIACL.NS","GICRE.NS","LICI.NS","SBILIFE.NS"],
-    "MUTHOOTFIN": ["MUTHOOTFIN.NS","MANAPPURAM.NS","CHOLAFIN.NS","BAJFINANCE.NS","SHRIRAMFIN.NS"],
-    "MANAPPURAM": ["MUTHOOTFIN.NS","MANAPPURAM.NS","CHOLAFIN.NS","BAJFINANCE.NS","SHRIRAMFIN.NS"],
-    "SHRIRAMFIN": ["SHRIRAMFIN.NS","BAJFINANCE.NS","CHOLAFIN.NS","M&MFIN.NS","MUTHOOTFIN.NS"],
-    "M&MFIN":    ["M&MFIN.NS","SHRIRAMFIN.NS","CHOLAFIN.NS","BAJFINANCE.NS","MUTHOOTFIN.NS"],
-    "CHOLAFIN":  ["CHOLAFIN.NS","BAJFINANCE.NS","M&MFIN.NS","SHRIRAMFIN.NS","MUTHOOTFIN.NS"],
+    # ── Brokers / Stock Exchanges ──────────────────────────────────────────────
+    "ANGELONE":   ["ANGELONE.NS","MOFSL.NS","IIFLSEC.NS","5PAISA.NS","ISEC.NS","NUVAMA.NS","EMKAY.NS","GEOJITFSL.NS","SMCGLOBAL.NS","CHOICEIN.NS"],
+    "5PAISA":     ["5PAISA.NS","ANGELONE.NS","MOFSL.NS","IIFLSEC.NS","ISEC.NS","NUVAMA.NS","EMKAY.NS","GEOJITFSL.NS"],
+    "MOFSL":      ["MOFSL.NS","ANGELONE.NS","IIFLSEC.NS","5PAISA.NS","ISEC.NS","NUVAMA.NS","EMKAY.NS","GEOJITFSL.NS","SMCGLOBAL.NS"],
+    "IIFLSEC":    ["IIFLSEC.NS","ANGELONE.NS","MOFSL.NS","5PAISA.NS","ISEC.NS","NUVAMA.NS","EMKAY.NS"],
+    "ISEC":       ["ISEC.NS","ANGELONE.NS","MOFSL.NS","IIFLSEC.NS","5PAISA.NS","NUVAMA.NS","EMKAY.NS","GEOJITFSL.NS"],
+    "NUVAMA":     ["NUVAMA.NS","MOFSL.NS","IIFLSEC.NS","ISEC.NS","ANGELONE.NS","EMKAY.NS","GEOJITFSL.NS"],
+    "EMKAY":      ["EMKAY.NS","MOFSL.NS","IIFLSEC.NS","ISEC.NS","5PAISA.NS","NUVAMA.NS","GEOJITFSL.NS"],
+    "GEOJITFSL":  ["GEOJITFSL.NS","ANGELONE.NS","MOFSL.NS","5PAISA.NS","ISEC.NS","EMKAY.NS"],
+    "SMCGLOBAL":  ["SMCGLOBAL.NS","ANGELONE.NS","MOFSL.NS","5PAISA.NS","IIFLSEC.NS","CHOICEIN.NS"],
+    "CHOICEIN":   ["CHOICEIN.NS","ANGELONE.NS","5PAISA.NS","MOFSL.NS","GEOJITFSL.NS","SMCGLOBAL.NS"],
+    "BSELTD":     ["BSELTD.NS","MCX.NS","CDSL.NS","CAMS.NS","KFINTECH.NS","ANGELONE.NS"],
+    "MCX":        ["MCX.NS","BSELTD.NS","CDSL.NS","ANGELONE.NS","MOFSL.NS"],
+    # ── Market Infrastructure (Depositories / Registrars) ─────────────────────
+    "CDSL":       ["CDSL.NS","CAMS.NS","KFINTECH.NS","BSELTD.NS","MCX.NS","ANGELONE.NS","MOFSL.NS"],
+    "CAMS":       ["CAMS.NS","KFINTECH.NS","CDSL.NS","BSELTD.NS","HDFCAMC.NS","NIPPONLIFE.NS"],
+    "KFINTECH":   ["KFINTECH.NS","CAMS.NS","CDSL.NS","BSELTD.NS","HDFCAMC.NS"],
+    # ── Asset Management ──────────────────────────────────────────────────────
+    "HDFCAMC":    ["HDFCAMC.NS","NIPPONLIFE.NS","ABSLAMC.NS","UTIAMC.NS","360ONE.NS","MOFSL.NS"],
+    "NIPPONLIFE":  ["NIPPONLIFE.NS","HDFCAMC.NS","ABSLAMC.NS","UTIAMC.NS","360ONE.NS"],
+    "ABSLAMC":    ["ABSLAMC.NS","HDFCAMC.NS","NIPPONLIFE.NS","UTIAMC.NS","360ONE.NS"],
+    "UTIAMC":     ["UTIAMC.NS","HDFCAMC.NS","NIPPONLIFE.NS","ABSLAMC.NS","360ONE.NS"],
+    "360ONE":     ["360ONE.NS","HDFCAMC.NS","NIPPONLIFE.NS","ABSLAMC.NS","NUVAMA.NS","MOFSL.NS"],
+    # ── Life Insurance ────────────────────────────────────────────────────────
+    "SBILIFE":    ["SBILIFE.NS","HDFCLIFE.NS","ICICIPRULI.NS","LICI.NS","MAXLIFE.NS","TATAAIA.NS"],
+    "HDFCLIFE":   ["HDFCLIFE.NS","SBILIFE.NS","ICICIPRULI.NS","LICI.NS","MAXLIFE.NS","TATAAIA.NS"],
+    "ICICIPRULI": ["ICICIPRULI.NS","SBILIFE.NS","HDFCLIFE.NS","LICI.NS","MAXLIFE.NS"],
+    "LICI":       ["LICI.NS","SBILIFE.NS","HDFCLIFE.NS","ICICIPRULI.NS","GICRE.NS","NIACL.NS"],
+    "MAXLIFE":    ["MAXLIFE.NS","SBILIFE.NS","HDFCLIFE.NS","ICICIPRULI.NS","LICI.NS"],
+    # ── General Insurance ─────────────────────────────────────────────────────
+    "STARHEALTH": ["STARHEALTH.NS","NIACL.NS","GICRE.NS","ICICIGI.NS","SBILIFE.NS","HDFCLIFE.NS"],
+    "GICRE":      ["GICRE.NS","NIACL.NS","STARHEALTH.NS","ICICIGI.NS"],
+    "NIACL":      ["NIACL.NS","GICRE.NS","STARHEALTH.NS","ICICIGI.NS"],
+    # ── NBFCs / Consumer Finance ──────────────────────────────────────────────
+    "BAJFINANCE": ["BAJFINANCE.NS","CHOLAFIN.NS","SHRIRAMFIN.NS","M&MFIN.NS","MUTHOOTFIN.NS","MANAPPURAM.NS","LTFH.NS","POONAWALLA.NS"],
+    "CHOLAFIN":   ["CHOLAFIN.NS","BAJFINANCE.NS","SHRIRAMFIN.NS","M&MFIN.NS","MUTHOOTFIN.NS","LTFH.NS"],
+    "MUTHOOTFIN": ["MUTHOOTFIN.NS","MANAPPURAM.NS","CHOLAFIN.NS","BAJFINANCE.NS","SHRIRAMFIN.NS","IIFL.NS"],
+    "MANAPPURAM": ["MANAPPURAM.NS","MUTHOOTFIN.NS","CHOLAFIN.NS","BAJFINANCE.NS","IIFL.NS"],
+    "SHRIRAMFIN": ["SHRIRAMFIN.NS","BAJFINANCE.NS","CHOLAFIN.NS","M&MFIN.NS","MUTHOOTFIN.NS","LTFH.NS"],
+    "M&MFIN":     ["M&MFIN.NS","SHRIRAMFIN.NS","CHOLAFIN.NS","BAJFINANCE.NS","MUTHOOTFIN.NS"],
+    "BAJAJFINSV": ["BAJAJFINSV.NS","BAJFINANCE.NS","CHOLAFIN.NS","SHRIRAMFIN.NS","M&MFIN.NS"],
+    # ── Large Banks ───────────────────────────────────────────────────────────
+    "HDFCBANK":   ["HDFCBANK.NS","ICICIBANK.NS","KOTAKBANK.NS","AXISBANK.NS","SBIN.NS","INDUSINDBK.NS","BANDHANBNK.NS","AUBANK.NS","FEDERALBNK.NS"],
+    "ICICIBANK":  ["ICICIBANK.NS","HDFCBANK.NS","KOTAKBANK.NS","AXISBANK.NS","SBIN.NS","INDUSINDBK.NS","BANDHANBNK.NS"],
+    "KOTAKBANK":  ["KOTAKBANK.NS","HDFCBANK.NS","ICICIBANK.NS","AXISBANK.NS","SBIN.NS","INDUSINDBK.NS"],
+    "AXISBANK":   ["AXISBANK.NS","HDFCBANK.NS","ICICIBANK.NS","KOTAKBANK.NS","SBIN.NS","INDUSINDBK.NS","BANDHANBNK.NS"],
+    "SBIN":       ["SBIN.NS","HDFCBANK.NS","ICICIBANK.NS","KOTAKBANK.NS","AXISBANK.NS","INDUSINDBK.NS","BANKBARODA.NS","PNB.NS"],
+    "INDUSINDBK": ["INDUSINDBK.NS","AXISBANK.NS","FEDERALBNK.NS","BANDHANBNK.NS","AUBANK.NS","KOTAKBANK.NS"],
+    "FEDERALBNK": ["FEDERALBNK.NS","INDUSINDBK.NS","BANDHANBNK.NS","AUBANK.NS","IDFCFIRSTB.NS","KTKBANK.NS"],
+    "BANDHANBNK": ["BANDHANBNK.NS","FEDERALBNK.NS","AUBANK.NS","IDFCFIRSTB.NS","INDUSINDBK.NS"],
+    "AUBANK":     ["AUBANK.NS","BANDHANBNK.NS","FEDERALBNK.NS","IDFCFIRSTB.NS","INDUSINDBK.NS","UJJIVANSFB.NS"],
+    # ── IT Services ───────────────────────────────────────────────────────────
+    "TCS":        ["TCS.NS","INFY.NS","WIPRO.NS","HCLTECH.NS","TECHM.NS","LTIM.NS","MPHASIS.NS","PERSISTENT.NS","COFORGE.NS","KPITTECH.NS"],
+    "INFY":       ["INFY.NS","TCS.NS","WIPRO.NS","HCLTECH.NS","TECHM.NS","LTIM.NS","MPHASIS.NS","PERSISTENT.NS","COFORGE.NS"],
+    "WIPRO":      ["WIPRO.NS","TCS.NS","INFY.NS","HCLTECH.NS","TECHM.NS","LTIM.NS","MPHASIS.NS"],
+    "HCLTECH":    ["HCLTECH.NS","TCS.NS","INFY.NS","WIPRO.NS","TECHM.NS","LTIM.NS","MPHASIS.NS","PERSISTENT.NS"],
+    "TECHM":      ["TECHM.NS","TCS.NS","INFY.NS","WIPRO.NS","HCLTECH.NS","LTIM.NS","MPHASIS.NS","PERSISTENT.NS","COFORGE.NS"],
+    "LTIM":       ["LTIM.NS","TCS.NS","INFY.NS","HCLTECH.NS","TECHM.NS","MPHASIS.NS","PERSISTENT.NS","COFORGE.NS","KPITTECH.NS"],
+    "MPHASIS":    ["MPHASIS.NS","LTIM.NS","PERSISTENT.NS","COFORGE.NS","KPITTECH.NS","INFY.NS","WIPRO.NS"],
+    "PERSISTENT": ["PERSISTENT.NS","COFORGE.NS","LTIM.NS","MPHASIS.NS","KPITTECH.NS","TECHM.NS"],
+    "COFORGE":    ["COFORGE.NS","PERSISTENT.NS","LTIM.NS","MPHASIS.NS","KPITTECH.NS","TECHM.NS"],
 }
+
+# ---------------------------------------------------------------------------
+# Screener.in peer scraping helpers
+# ---------------------------------------------------------------------------
+# Screener shows a "Peers" table on every company page — this is more accurate
+# than Yahoo Finance industry labels because it uses BSE/NSE sector codes directly.
+
+_SCREENER_SYM_MAP: dict[str, str] = {
+    # Screener symbol → Yahoo Finance NS ticker (special cases only)
+    "M&M":        "M&M.NS",
+    "M&MFIN":     "M&MFIN.NS",
+    "BAJAJ-AUTO": "BAJAJ-AUTO.NS",
+    "L&TFH":      "L&TFH.NS",
+    "L&T":        "LT.NS",
+}
+
+
+def _screener_sym_to_ns(sym: str) -> str:
+    """Convert a Screener.in symbol to a Yahoo Finance .NS ticker."""
+    return _SCREENER_SYM_MAP.get(sym, f"{sym}.NS")
+
+
+def _parse_screener_peers(soup, self_symbol: str) -> list[str]:
+    """
+    Extract peer tickers from a Screener.in company page.
+    Screener's peer table uses BSE/NSE sector codes — most accurate grouping available.
+    Returns list of Yahoo Finance .NS tickers, excluding self.
+    """
+    if not soup or not _BS4_AVAILABLE:
+        return []
+
+    peers = []
+    seen = {self_symbol.upper()}
+
+    try:
+        # Screener renders peers in a <section id="peers"> with a table of links
+        peers_section = (
+            soup.find(id="peers")
+            or soup.find("section", id="peers")
+            or soup.find("div", id="peers")
+        )
+        if not peers_section:
+            return []
+
+        for link in peers_section.find_all("a", href=True):
+            href = link.get("href", "")
+            if "/company/" not in href:
+                continue
+            # URL format: /company/SYMBOL/ or /company/SYMBOL/consolidated/
+            parts = [p for p in href.strip("/").split("/") if p]
+            if not parts or parts[0] != "company":
+                continue
+            sym = parts[1].upper() if len(parts) > 1 else ""
+            if not sym or sym in seen:
+                continue
+            seen.add(sym)
+            peers.append(_screener_sym_to_ns(sym))
+            if len(peers) >= 12:
+                break
+
+    except Exception as e:
+        print(f"[Screener peers] parse error for {self_symbol}: {e}")
+
+    return peers
 
 
 @app.get("/peers/{symbol}")
@@ -1687,8 +1793,15 @@ def get_peers(symbol: str):
         sector = (STOCK_UNIVERSE.get(symbol) or {}).get("sector", "")
 
     # ── 2. Build peer list ────────────────────────────────────────────────
-    # Priority: symbol override > industry-level > sector-level
+    # Priority: symbol override > industry-level > Screener.in > sector-level
+    #
+    # WHY override first: Screener uses broad BSE sector codes — MCX (exchange)
+    # sits in "Finance" alongside banks, so Screener returns banks as peers.
+    # Hardcoded overrides are manually verified and always correct for known stocks.
+    # Screener is used as a live fallback for all other companies.
     bare = symbol.replace(".NS","").replace(".BO","")
+
+    # 2a. Hardcoded override always wins — verified correct peers for known stocks
     if bare in _SYMBOL_PEER_OVERRIDE:
         peer_ns_list = _SYMBOL_PEER_OVERRIDE[bare]
         print(f"[peers] {symbol}: using symbol override → {bare}")
@@ -1696,8 +1809,22 @@ def get_peers(symbol: str):
         peer_ns_list = _INDUSTRY_PEERS[industry]
         print(f"[peers] {symbol}: industry='{industry}' → {len(peer_ns_list)} peers")
     else:
-        peer_ns_list = _SECTOR_PEERS.get(sector, [])
-        print(f"[peers] {symbol}: sector='{sector}' (industry='{industry}' not mapped)")
+        # 2b. Try Screener for companies NOT in the override / industry map
+        screener_peers: list[str] = []
+        try:
+            soup = _fetch_screener_page(symbol)
+            if soup:
+                screener_peers = _parse_screener_peers(soup, symbol)
+                print(f"[peers] {symbol}: Screener → {len(screener_peers)} peers: {screener_peers[:5]}")
+        except Exception as sc_err:
+            print(f"[peers] {symbol}: Screener scrape failed: {sc_err}")
+
+        if len(screener_peers) >= 3:
+            peer_ns_list = screener_peers
+            print(f"[peers] {symbol}: using Screener peers ({len(peer_ns_list)} total)")
+        else:
+            peer_ns_list = _SECTOR_PEERS.get(sector, [])
+            print(f"[peers] {symbol}: sector fallback '{sector}' (industry='{industry}' not mapped)")
 
     # Ensure self is included first; remove self from peers to avoid duplication
     peers_only = [p for p in peer_ns_list if p.replace(".NS","").replace(".BO","").lower() != bare.lower()][:6]
@@ -1768,7 +1895,71 @@ def get_peers(symbol: str):
         except Exception:
             pass  # skip peers that fail
 
-    result = {"sector": sector, "industry": industry, "peers": results}
+    # ── 5. Compute smart sector label (mirrors sectorModelMap.ts logic) ───────
+    # Maps Yahoo Finance industry → human-readable label shown in the peer table subtitle.
+    _SMART_LABEL_MAP: dict[str, str] = {
+        "Financial Data & Stock Exchanges": "Exchange / Capital Mkt",
+        "Asset Management": "Asset Management",
+        "Insurance—Life": "Life Insurance",
+        "Insurance—Diversified": "Insurance",
+        "Insurance": "Insurance",
+        "Banks—Regional": "Banking",
+        "Banks—Diversified": "Banking",
+        "Mortgage Finance": "Banking / Finance",
+        "Capital Markets": "Capital Markets",
+        "Credit Services": "NBFC / Finance",
+        "Consumer Finance": "NBFC / Finance",
+        "Auto Manufacturers": "Automobile",
+        "Auto Parts": "Auto Ancillary",
+        "Software—Application": "IT Services",
+        "Software—Infrastructure": "IT Services",
+        "Information Technology Services": "IT Services",
+        "Semiconductors": "Semiconductors",
+        "Telecom Services": "Telecom",
+        "Utilities—Regulated Electric": "Power / Utilities",
+        "Utilities—Independent Power Producers": "Power / Utilities",
+        "Oil & Gas Integrated": "Oil & Gas",
+        "Oil & Gas Refining & Marketing": "Oil & Gas",
+        "Oil & Gas E&P": "Oil & Gas",
+        "Steel": "Metal / Steel",
+        "Aluminum": "Metal / Aluminium",
+        "Pharmaceuticals—Diversified": "Pharma",
+        "Drug Manufacturers—General": "Pharma",
+        "Biotechnology": "Pharma / Biotech",
+        "Grocery Stores": "Retail / Consumer",
+        "Department Stores": "Retail / Consumer",
+        "Apparel Retail": "Retail / Consumer",
+        "Specialty Retail": "Retail / Consumer",
+        "Restaurants": "QSR / Restaurants",
+        "Engineering & Construction": "Infrastructure",
+        "Infrastructure Operations": "Infrastructure",
+        "Aerospace & Defense": "Defence / Aerospace",
+        "Real Estate—Development": "Real Estate",
+        "REIT—Diversified": "Real Estate / REIT",
+        "Agricultural Inputs": "Agri / Chemicals",
+        "Specialty Chemicals": "Specialty Chemicals",
+        "Conglomerates": "Diversified / Conglomerate",
+    }
+    # Override by symbol for special cases
+    _SMART_LABEL_SYM: dict[str, str] = {
+        "MCX": "Exchange / Capital Mkt",
+        "BSELTD": "Exchange / Capital Mkt",
+        "CDSL": "Depository / Registrar",
+        "CAMS": "Depository / Registrar",
+        "KFINTECH": "Depository / Registrar",
+        "HDFCAMC": "Asset Management",
+        "NIPPONLIFE": "Asset Management",
+        "ABSLAMC": "Asset Management",
+        "UTIAMC": "Asset Management",
+        "360ONE": "Wealth Management",
+    }
+    smart_label = (
+        _SMART_LABEL_SYM.get(bare)
+        or _SMART_LABEL_MAP.get(industry, "")
+        or sector
+    )
+
+    result = {"sector": smart_label or sector, "industry": industry, "peers": results}
     _cache_set(cache_key, result)
     return result
 
