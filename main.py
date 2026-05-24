@@ -269,9 +269,9 @@ def _cr(val_str: str) -> float:
 
 def _parse_screener_ratios(soup: Any) -> dict:
     """
-    Extract key ratios from the #top-ratios section.
-    Returns dict with: currentPrice, marketCap, pe, pb, roe, dividendYield,
-                       bookValue, roce, debtToEquity (derived), sector
+    Extract key ratios from Screener.in #top-ratios section.
+    Returns: currentPrice, marketCap, pe, pb, roe, roce, dividendYield,
+             bookValue, debtToEquity, week52High, week52Low, sector, industry
     """
     ratios: dict = {}
 
@@ -283,7 +283,8 @@ def _parse_screener_ratios(soup: Any) -> dict:
             if len(spans) < 2:
                 continue
             name  = spans[0].get_text(strip=True).lower()
-            value = spans[-1].get_text(strip=True).replace(",", "").replace("₹", "").replace("%", "").replace("Cr.", "").replace("Cr", "").strip()
+            raw   = spans[-1].get_text(strip=True)
+            value = raw.replace(",", "").replace("₹", "").replace("%", "").replace("Cr.", "").replace("Cr", "").strip()
 
             try:
                 if "market cap" in name:
@@ -302,6 +303,14 @@ def _parse_screener_ratios(soup: Any) -> dict:
                     ratios["roe"] = float(value)
                 elif "debt / equity" in name or "debt/equity" in name:
                     ratios["debtToEquity"] = float(value)
+                elif "high / low" in name or "52 week" in name:
+                    # Format: "3,480 / 1,278" → high=3480, low=1278
+                    parts = raw.replace(",", "").split("/")
+                    if len(parts) == 2:
+                        ratios["week52High"] = float(parts[0].strip().replace("₹",""))
+                        ratios["week52Low"]  = float(parts[1].strip().replace("₹",""))
+                elif "face value" in name or "face val" in name:
+                    ratios["faceValue"] = float(value)
             except (ValueError, TypeError):
                 pass
 
@@ -310,6 +319,28 @@ def _parse_screener_ratios(soup: Any) -> dict:
     bv    = ratios.get("bookValue", 0)
     if price > 0 and bv > 0:
         ratios["pb"] = round(price / bv, 2)
+
+    # ── Industry from Screener's breadcrumb / tags (more precise than Yahoo) ─
+    # Screener shows the industry category in breadcrumb or tag links.
+    # e.g.: /screens/industry/commodity-exchanges/ → "Commodity Exchanges"
+    try:
+        for a in soup.find_all("a", href=True):
+            href = a.get("href", "")
+            if "/screens/industry/" in href or "/screens/sector/" in href:
+                label = a.get_text(strip=True)
+                if label and len(label) > 2:
+                    ratios["screenerIndustry"] = label
+                    break
+        # Also check the company info section for sector/industry links
+        company_info = soup.find(class_="company-links") or soup.find(class_="sub-links")
+        if company_info and "screenerIndustry" not in ratios:
+            for a in company_info.find_all("a", href=True):
+                label = a.get_text(strip=True)
+                if label and len(label) > 3 and "NSE" not in label and "BSE" not in label:
+                    ratios["screenerIndustry"] = label
+                    break
+    except Exception:
+        pass
 
     # ── Sector from company info section ────────────────────────────────────
     about = soup.find(id="about") or soup.find(class_="company-info")
@@ -322,12 +353,11 @@ def _parse_screener_ratios(soup: Any) -> dict:
                 if nxt:
                     ratios["sector"] = nxt.get_text(strip=True)
 
-    # Fallback: check meta description or title for sector hints
+    # Fallback: meta description
     if "sector" not in ratios:
         meta = soup.find("meta", {"name": "description"})
         if meta:
             content = meta.get("content", "")
-            # Screener often puts sector in description
             m = re.search(r'in the ([A-Za-z &]+) sector', content)
             if m:
                 ratios["sector"] = m.group(1).strip()
@@ -720,6 +750,116 @@ def _cache_get(key: str) -> Any | None:
 
 def _cache_set(key: str, data: Any) -> None:
     _cache[key] = (data, time.time())
+
+
+# ---------------------------------------------------------------------------
+# NSE Bhavcopy — official end-of-day price feed (free, no auth needed)
+# ---------------------------------------------------------------------------
+# NSE publishes a full Bhavcopy CSV every trading day at ~6pm IST.
+# URL: https://nsearchives.nseindia.com/products/content/sec_bhavdata_full_DDMMYYYY.csv
+# Contains: SYMBOL, SERIES, PREV_CLOSE, OPEN, HIGH, LOW, CLOSE for all NSE stocks.
+# We download once per day and cache in memory — single source for current price.
+# ---------------------------------------------------------------------------
+
+_BHAVCOPY: dict[str, dict] = {}   # symbol → {close, prevClose, open, high, low}
+_BHAVCOPY_DATE: str = ""          # DDMMYYYY of last successful load
+_BHAVCOPY_LOCK = False            # simple flag to prevent concurrent downloads
+
+
+def _refresh_bhavcopy() -> None:
+    """Download the most recent NSE Bhavcopy CSV and cache all prices."""
+    global _BHAVCOPY, _BHAVCOPY_DATE, _BHAVCOPY_LOCK
+
+    today = datetime.now()
+    today_str = today.strftime("%d%m%Y")
+
+    if _BHAVCOPY_DATE == today_str and _BHAVCOPY:
+        return   # Already loaded today
+    if _BHAVCOPY_LOCK:
+        return   # Another request is loading it
+
+    _BHAVCOPY_LOCK = True
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Referer": "https://www.nseindia.com/",
+        }
+        # Try last 5 calendar days (handles weekends + holidays)
+        for delta in range(5):
+            d = today - timedelta(days=delta)
+            ds = d.strftime("%d%m%Y")
+            url = f"https://nsearchives.nseindia.com/products/content/sec_bhavdata_full_{ds}.csv"
+            try:
+                resp = requests.get(url, headers=headers, timeout=30)
+                if resp.status_code != 200 or len(resp.content) < 5000:
+                    continue
+
+                new_cache: dict[str, dict] = {}
+                lines = resp.text.strip().split("\n")
+                if not lines:
+                    continue
+
+                # Parse header to detect column positions (handles format changes)
+                header = [h.strip().upper() for h in lines[0].split(",")]
+
+                def col(name: str, *aliases: str) -> int:
+                    for candidate in (name,) + aliases:
+                        if candidate in header:
+                            return header.index(candidate)
+                    return -1
+
+                idx_sym    = col("SYMBOL")
+                idx_series = col("SERIES")
+                idx_close  = col("CLOSE_PRICE", "CLOSE")
+                idx_prev   = col("PREV_CLOSE", "PREVCLOSE")
+                idx_open   = col("OPEN_PRICE", "OPEN")
+                idx_high   = col("HIGH_PRICE", "HIGH")
+                idx_low    = col("LOW_PRICE", "LOW")
+
+                if idx_sym < 0 or idx_close < 0:
+                    continue  # Unrecognised format
+
+                for line in lines[1:]:
+                    parts = [p.strip() for p in line.split(",")]
+                    if len(parts) <= max(idx_sym, idx_close):
+                        continue
+                    series = parts[idx_series].strip() if idx_series >= 0 else "EQ"
+                    if series not in ("EQ", "BE", "BZ", "SM"):
+                        continue  # Skip F&O, currency etc.
+                    sym = parts[idx_sym].strip().upper()
+                    if not sym:
+                        continue
+                    try:
+                        new_cache[sym] = {
+                            "close":     float(parts[idx_close]) if idx_close >= 0 else 0,
+                            "prevClose": float(parts[idx_prev])  if idx_prev  >= 0 else 0,
+                            "open":      float(parts[idx_open])  if idx_open  >= 0 else 0,
+                            "high":      float(parts[idx_high])  if idx_high  >= 0 else 0,
+                            "low":       float(parts[idx_low])   if idx_low   >= 0 else 0,
+                        }
+                    except (ValueError, IndexError):
+                        pass
+
+                if len(new_cache) > 500:
+                    _BHAVCOPY = new_cache
+                    _BHAVCOPY_DATE = today_str  # mark as today so we don't re-fetch
+                    print(f"[Bhavcopy] Loaded {len(_BHAVCOPY)} stocks from NSE ({ds})")
+                    return
+
+            except Exception as e:
+                print(f"[Bhavcopy] Error fetching {ds}: {e}")
+
+        print("[Bhavcopy] Could not load data for last 5 trading days — will use Screener price")
+    finally:
+        _BHAVCOPY_LOCK = False
+
+
+def _bhavcopy_price(symbol: str) -> dict | None:
+    """Return Bhavcopy price dict for symbol, or None if unavailable."""
+    _refresh_bhavcopy()
+    bare = symbol.upper().replace(".NS", "").replace(".BO", "")
+    return _BHAVCOPY.get(bare)
 
 
 # ---------------------------------------------------------------------------
@@ -1179,11 +1319,13 @@ def financials(symbol: str):
 @app.get("/company-v2/{symbol}")
 def company_v2(symbol: str):
     """
-    Company fundamentals — Screener.in primary, Yahoo Finance fallback.
+    Company fundamentals — Screener.in + NSE Bhavcopy. No Yahoo Finance.
 
-    Screener gives: P/E, P/B, ROE, ROCE, Market Cap, Book Value, D/E from BSE filings.
-    Yahoo gives:    live price, change%, 52-week high/low, beta, shares outstanding.
-    Combined:       best-of-both response with same interface as /company.
+    Sources:
+      NSE Bhavcopy  → current price, previous close, change, change%  (official EOD)
+      Screener.in   → all fundamentals: P/E, P/B, ROE, ROCE, Market Cap,
+                       Book Value, D/E, Dividend Yield, 52W High/Low, sector
+      Local universe → company name, exchange fallback
     """
     symbol = symbol.upper().strip()
     cache_key = f"company_v2:{symbol}"
@@ -1191,101 +1333,103 @@ def company_v2(symbol: str):
     if cached is not None:
         return cached
 
-    # ── Always fetch live price from Yahoo — it's reliable for this ──────────
-    ns, exchange = _resolve_ticker(symbol)
-    data = _yf_summary(ns, "price,defaultKeyStatistics,summaryDetail,assetProfile,financialData")
+    stock_meta = STOCK_UNIVERSE.get(symbol, {})
+    _ns, exchange = _resolve_ticker(symbol)
 
-    pr = data.get("price", {})
-    ks = data.get("defaultKeyStatistics", {})
-    sd = data.get("summaryDetail", {})
-    ap = data.get("assetProfile", {})
-    fd = data.get("financialData", {})
+    # ── 1. Screener.in — all fundamentals ────────────────────────────────────
+    soup = _fetch_screener_page(symbol)
+    if not soup:
+        raise HTTPException(404, f"Company {symbol} not found on Screener.in")
 
-    def rv(d: dict, key: str) -> Any:
-        v = d.get(key)
-        if isinstance(v, dict):
-            return v.get("raw")
-        return v
+    ratios = _parse_screener_ratios(soup)
 
-    price_val  = safe_val(rv(pr, "regularMarketPrice") or rv(fd, "currentPrice"))
-    prev_close = safe_val(rv(pr, "regularMarketPreviousClose") or rv(sd, "previousClose"))
-    change     = round(price_val - prev_close, 2) if prev_close else 0.0
-    change_pct = round((change / prev_close) * 100, 2) if prev_close else 0.0
-    shares_cr  = round(safe_val(rv(ks, "sharesOutstanding")) / 1e7, 2)
-    beta       = safe_val(rv(ks, "beta"))
-    w52_high   = safe_val(rv(sd, "fiftyTwoWeekHigh"))
-    w52_low    = safe_val(rv(sd, "fiftyTwoWeekLow"))
-    rev_g      = rv(fd, "revenueGrowth")
-    ear_g      = rv(fd, "earningsGrowth")
-    fwd_pe     = safe_val(rv(sd, "forwardPE"))
+    # Extract company name from Screener's <h1> or page title
+    screener_name = ""
+    h1 = soup.find("h1")
+    if h1:
+        screener_name = h1.get_text(strip=True)
+    if not screener_name:
+        title = soup.find("title")
+        if title:
+            screener_name = title.get_text(strip=True).split("|")[0].strip()
+
+    # ── 2. NSE Bhavcopy — official EOD price + change ─────────────────────────
+    bhav = _bhavcopy_price(symbol)
+
+    if bhav and bhav.get("close", 0) > 0:
+        price_val  = bhav["close"]
+        prev_close = bhav["prevClose"]
+        change     = round(price_val - prev_close, 2) if prev_close else 0.0
+        change_pct = round((change / prev_close) * 100, 2) if prev_close and prev_close > 0 else 0.0
+        price_src  = "bhavcopy"
+    else:
+        # Fallback: use Screener's current price (15-min delayed but fine for research tool)
+        price_val  = ratios.get("currentPrice", 0.0)
+        prev_close = 0.0
+        change     = 0.0
+        change_pct = 0.0
+        price_src  = "screener"
 
     if price_val == 0:
-        raise HTTPException(404, f"No price data for {ns}")
+        raise HTTPException(404, f"No price data available for {symbol}")
 
-    # Resolve final exchange label
-    yf_exchange = rv(pr, "exchangeName") or rv(pr, "exchange") or ""
-    if "NSE" in str(yf_exchange).upper():
-        exchange = "NSE"
-    elif "BSE" in str(yf_exchange).upper() or "BOM" in str(yf_exchange).upper():
-        exchange = "BSE"
+    # ── 3. Derive fields from Screener data ───────────────────────────────────
+    market_cap  = ratios.get("marketCap", 0.0)
+    pe          = ratios.get("pe", 0.0)
+    pb          = ratios.get("pb", 0.0)
+    roe         = ratios.get("roe", 0.0)
+    roce        = ratios.get("roce", 0.0)
+    de          = ratios.get("debtToEquity", 0.0)
+    div_yield   = ratios.get("dividendYield", 0.0)
+    book_value  = ratios.get("bookValue", 0.0)
+    w52_high    = ratios.get("week52High", 0.0)
+    w52_low     = ratios.get("week52Low", 0.0)
 
-    stock_meta = STOCK_UNIVERSE.get(symbol, {})
+    # Derive EPS from price / PE (when Screener doesn't give EPS directly)
+    eps = round(price_val / pe, 2) if pe and pe > 0 else 0.0
 
-    # Build base result from Yahoo (always available)
+    # Sector: prefer Screener's own industry tag, then screener sector, then universe
+    sector   = ratios.get("screenerIndustry") or ratios.get("sector") or stock_meta.get("sector", "Unknown")
+    industry = ratios.get("screenerIndustry", "")
+
+    name = (
+        screener_name
+        or stock_meta.get("name", "")
+        or symbol
+    )
+
     result = {
         "symbol":         symbol,
-        "name":           rv(pr, "longName") or rv(pr, "shortName") or stock_meta.get("name", symbol),
-        "sector":         ap.get("sector") or stock_meta.get("sector", "Unknown"),
-        "industry":       ap.get("industry", ""),
-        "exchange":       exchange,
-        "currentPrice":   price_val,
-        "previousClose":  prev_close,
+        "name":           name,
+        "sector":         sector,
+        "industry":       industry,
+        "exchange":       "NSE" if stock_meta.get("exchange", "NSE") != "BSE" else "BSE",
+        "currentPrice":   round(price_val, 2),
+        "previousClose":  round(prev_close, 2),
         "change":         change,
         "changePct":      change_pct,
-        "marketCap":      round(safe_val(rv(pr, "marketCap") or rv(sd, "marketCap")) / 1e7, 2),
-        "pe":             safe_val(rv(sd, "trailingPE")),
-        "forwardPE":      fwd_pe,
-        "pb":             safe_val(rv(ks, "priceToBook")),
-        "roe":            round(float(rv(fd, "returnOnEquity")) * 100, 2) if rv(fd, "returnOnEquity") else 0.0,
-        "roa":            round(float(rv(fd, "returnOnAssets")) * 100, 2) if rv(fd, "returnOnAssets") else 0.0,
-        "eps":            safe_val(rv(ks, "trailingEps")),
-        "dividendYield":  round(float(rv(sd, "dividendYield")) * 100, 2) if rv(sd, "dividendYield") else 0.0,
+        "marketCap":      round(market_cap, 2),
+        "pe":             pe,
+        "forwardPE":      0.0,    # Screener doesn't publish forward PE
+        "pb":             pb,
+        "roe":            roe,
+        "roa":            0.0,    # Screener doesn't show ROA directly
+        "roce":           roce,
+        "eps":            eps,
+        "dividendYield":  div_yield,
         "week52High":     w52_high,
         "week52Low":      w52_low,
-        "debtToEquity":   round(safe_val(rv(fd, "debtToEquity")) / 100, 2) if rv(fd, "debtToEquity") else 0.0,
-        "currentRatio":   safe_val(rv(fd, "currentRatio")),
-        "shares":         shares_cr,
-        "beta":           beta,
-        "revenueGrowth":  round(float(rev_g) * 100, 2) if rev_g else 0.0,
-        "earningsGrowth": round(float(ear_g) * 100, 2) if ear_g else 0.0,
-        "dataSource":     "yahoo",
+        "debtToEquity":   de,
+        "bookValue":      book_value,
+        "currentRatio":   0.0,    # Not on Screener top-ratios; available in balance sheet
+        "shares":         round(market_cap / price_val, 2) if price_val > 0 and market_cap > 0 else 0.0,
+        "beta":           0.0,    # Not needed for a valuation tool
+        "revenueGrowth":  0.0,    # Computed from financials-v2 instead
+        "earningsGrowth": 0.0,
+        "dataSource":     f"screener+{price_src}",
     }
 
-    # ── Overlay with Screener.in fundamentals (much more accurate) ────────────
-    try:
-        soup = _fetch_screener_page(symbol)
-        if soup:
-            ratios = _parse_screener_ratios(soup)
-
-            # Screener values override Yahoo for these fields (higher accuracy)
-            if ratios.get("pe",          0) > 0:  result["pe"]          = ratios["pe"]
-            if ratios.get("pb",          0) > 0:  result["pb"]          = ratios["pb"]
-            if ratios.get("roe",         0) > 0:  result["roe"]         = ratios["roe"]
-            if ratios.get("roce",        0) > 0:  result["roce"]        = ratios["roce"]
-            if ratios.get("marketCap",   0) > 0:  result["marketCap"]   = ratios["marketCap"]
-            if ratios.get("bookValue",   0) > 0:  result["bookValue"]   = ratios["bookValue"]
-            if ratios.get("dividendYield",0) >= 0: result["dividendYield"] = ratios.get("dividendYield", result["dividendYield"])
-            if ratios.get("debtToEquity",0) > 0:  result["debtToEquity"]  = ratios["debtToEquity"]
-            if ratios.get("sector",      ""):     result["sector"]       = ratios["sector"]
-
-            result["dataSource"] = "screener+yahoo"
-            print(f"[Screener] {symbol}: fundamentals loaded from Screener.in ✓")
-        else:
-            print(f"[Screener] {symbol}: page unavailable, using Yahoo fundamentals")
-
-    except Exception as e:
-        print(f"[Screener] {symbol} overlay error: {e}")
-
+    print(f"[company-v2] {symbol}: price={price_val} ({price_src}), PE={pe}, ROE={roe} ✓")
     _cache_set(cache_key, result)
     return result
 
