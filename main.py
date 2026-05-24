@@ -1,6 +1,6 @@
 """
 ROBU Data Server
-FastAPI server providing Indian stock data via yfinance.
+FastAPI server providing Indian stock data via Screener.in.
 Supports full NSE universe (~2000 stocks) downloaded from NSE on startup.
 
 Run: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
@@ -8,7 +8,6 @@ Run: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-import yfinance as yf
 import pandas as pd
 import numpy as np
 import time
@@ -967,8 +966,8 @@ def _yf_summary(symbol_ns: str, modules: str) -> dict:
     return results[0]
 
 
-# Initialise Yahoo session at startup
-_init_yahoo()
+# Yahoo Finance session initialisation disabled — all data now via Screener.in
+# _init_yahoo()  # <-- was here; removed to avoid startup delay on Railway
 
 
 # ---------------------------------------------------------------------------
@@ -1079,16 +1078,7 @@ def search(q: str = ""):
     contains.sort(key=_rank)
     local = (exact + starts + contains)[:20]
 
-    # If local universe has few hits, augment with Yahoo Finance live search
-    # This catches BSE-only stocks (SME, exclusive listings) not in local cache
-    if len(local) < 6 and len(q) >= 3:
-        yf_results = _yahoo_search(q)
-        seen = {r["symbol"] for r in local}
-        for r in yf_results:
-            if r["symbol"] not in seen:
-                local.append(r)
-                seen.add(r["symbol"])
-
+    # Yahoo Finance search fallback removed — search is now NSE universe only
     return local[:20]
 
 
@@ -1457,16 +1447,16 @@ def financials_v2(symbol: str):
         print(f"[Screener] financials_v2 error for {symbol}: {e}")
 
     if screener_data and len(screener_data) >= 2:
-        # Attach shares from Yahoo (Screener doesn't expose shares outstanding directly)
+        # Compute shares from Market Cap / Price (no Yahoo needed)
         try:
-            ns     = _get_yf_ticker(symbol)
-            ks_raw = _yf_summary(ns, "defaultKeyStatistics").get("defaultKeyStatistics", {})
-            so_raw = ks_raw.get("sharesOutstanding")
-            shares_cr = float(
-                so_raw.get("raw", 0) if isinstance(so_raw, dict) else (so_raw or 0)
-            ) / 1e7
-            for row in screener_data:
-                row["shares"] = round(shares_cr, 2)
+            cv2 = _cache_get(f"company_v2:{symbol}")
+            if cv2:
+                mktcap = float(cv2.get("marketCap", 0) or 0)   # in ₹ Cr
+                price  = float(cv2.get("currentPrice", 0) or 0)
+                if mktcap > 0 and price > 0:
+                    shares_cr = round(mktcap / price, 2)        # shares in Cr
+                    for row in screener_data:
+                        row["shares"] = shares_cr
         except Exception:
             pass  # shares is optional — valuation models have fallbacks
 
@@ -1474,57 +1464,154 @@ def financials_v2(symbol: str):
         print(f"[Screener] {symbol}: {len(screener_data)} years from Screener.in ✓")
         return screener_data
 
-    # ── Fallback: Yahoo Finance ──────────────────────────────────────────────
-    print(f"[Screener] {symbol}: Screener unavailable, using Yahoo Finance")
-    try:
-        yahoo_data = financials(symbol)
-        for row in yahoo_data:
-            row["source"] = "yahoo"
-        _cache_set(cache_key, yahoo_data)
-        return yahoo_data
-    except Exception as e:
-        raise HTTPException(500, f"Both Screener and Yahoo failed for {symbol}: {e}")
+    # ── Fallback: return empty with error rather than Yahoo ──────────────────
+    raise HTTPException(404, f"Screener.in data unavailable for {symbol}. Ensure SCREENER_USERNAME/SCREENER_PASSWORD are set.")
 
 
 @app.get("/price/{symbol}")
 def price(symbol: str):
-    """Quick current price endpoint — direct Yahoo Finance API."""
+    """Quick current price — NSE Bhavcopy (official EOD). No Yahoo Finance."""
     symbol = symbol.upper().strip()
     cache_key = f"price:{symbol}"
     cached = _cache_get(cache_key)
     if cached is not None:
         return cached
 
-    ns = symbol + ".NS"
-    data = _yf_summary(ns, "price")
-    pr = data.get("price", {})
+    bhav = _bhavcopy_price(symbol)
+    if bhav and bhav.get("close", 0) > 0:
+        p = bhav["close"]
+        pc = bhav.get("prevClose", 0)
+        chg = round(p - pc, 2) if pc else 0.0
+        chg_pct = round((chg / pc) * 100, 2) if pc else 0.0
+        result = {"symbol": symbol, "price": p, "change": chg, "changePct": chg_pct, "source": "bhavcopy"}
+        _cache_set(cache_key, result)
+        return result
 
-    def rv(d: dict, key: str) -> Any:
-        v = d.get(key)
-        return v.get("raw") if isinstance(v, dict) else v
+    # Fallback: try Screener's current price
+    soup = _fetch_screener_page(symbol)
+    if soup:
+        ratios = _parse_screener_ratios(soup)
+        p = ratios.get("currentPrice", 0)
+        if p:
+            result = {"symbol": symbol, "price": p, "change": 0.0, "changePct": 0.0, "source": "screener"}
+            _cache_set(cache_key, result)
+            return result
 
-    current_price = safe_val(rv(pr, "regularMarketPrice"))
-    prev_close = safe_val(rv(pr, "regularMarketPreviousClose"))
-    change = round(current_price - prev_close, 2) if current_price and prev_close else 0.0
-    change_pct = round((change / prev_close) * 100, 2) if prev_close else 0.0
+    raise HTTPException(404, f"No price data for {symbol}")
 
-    result = {"symbol": symbol, "price": current_price, "change": change, "changePct": change_pct}
-    _cache_set(cache_key, result)
-    return result
+
+# ---------------------------------------------------------------------------
+# Screener.in Chart API — 5Y historical P/E, P/B, Price
+# ---------------------------------------------------------------------------
+
+def _get_screener_company_id(soup) -> str | None:
+    """Extract Screener.in numeric company ID from the parsed company page."""
+    if not soup:
+        return None
+    # Method 1: data-id on #company-graph div (most common)
+    for el in soup.find_all(attrs={"data-id": True}):
+        val = str(el.get("data-id", "")).strip()
+        if val.isdigit() and len(val) >= 2:
+            return val
+    # Method 2: JavaScript variable in script tags
+    for script in soup.find_all("script"):
+        text = script.string or ""
+        m = re.search(r'(?:companyId|company_id|data-id)["\']?\s*[:=]\s*["\']?(\d+)', text)
+        if m:
+            return m.group(1)
+    # Method 3: embedded in a form or hidden input
+    for inp in soup.find_all("input", {"type": "hidden"}):
+        name = inp.get("name", "").lower()
+        if "company" in name or "id" == name:
+            val = str(inp.get("value", "")).strip()
+            if val.isdigit():
+                return val
+    return None
+
+
+def _normalize_screener_date(raw: str) -> str:
+    """Convert Screener date formats (Jan 2024, 2024 Q1, 2024-01) to YYYY-MM."""
+    raw = str(raw).strip()
+    # YYYY-MM or YYYY-MM-DD
+    m = re.match(r"^(\d{4})-(\d{2})", raw)
+    if m:
+        return f"{m.group(1)}-{m.group(2)}"
+    # "Jan 2024" or "January 2024"
+    months = {"jan":"01","feb":"02","mar":"03","apr":"04","may":"05","jun":"06",
+              "jul":"07","aug":"08","sep":"09","oct":"10","nov":"11","dec":"12"}
+    m = re.match(r"^([A-Za-z]{3})[a-z]*\s*(\d{4})", raw)
+    if m:
+        return f"{m.group(2)}-{months.get(m.group(1).lower(), '01')}"
+    # "2024 Q1" → Indian FY: Q1=Jun, Q2=Sep, Q3=Dec, Q4=Mar
+    m = re.match(r"^(\d{4})\s+Q(\d)", raw)
+    if m:
+        q_map = {"1": "06", "2": "09", "3": "12", "4": "03"}
+        yr = int(m.group(1))
+        q  = m.group(2)
+        if q == "4":
+            yr += 1
+        return f"{yr}-{q_map.get(q, '06')}"
+    # Unix ms timestamp
+    if re.match(r"^\d{12,13}$", raw):
+        try:
+            return datetime.utcfromtimestamp(int(raw) // 1000).strftime("%Y-%m")
+        except Exception:
+            pass
+    return raw[:7] if len(raw) >= 7 else raw
+
+
+def _fetch_screener_chart_api(company_id: str, metric: str, days: int = 1825) -> list:
+    """
+    Call Screener.in chart API for historical metric time-series.
+    Returns list of {"date": "YYYY-MM", "value": float}.
+    Metrics: "Price", "Price-to-Earning", "Price-to-Book", "Return-on-Equity", "EPS"
+    """
+    sess = _get_screener_session()
+    url  = f"https://www.screener.in/api/company/{company_id}/chart/"
+    params = {"q": metric, "days": days, "consolidated": "true"}
+
+    try:
+        if sess:
+            resp = sess.get(url, params=params, timeout=20)
+        elif _CURL_AVAILABLE:
+            resp = cffi_requests.get(url, params=params, headers=_make_browser_headers(), timeout=20, impersonate="chrome124")
+        else:
+            resp = requests.get(url, params=params, headers=_make_browser_headers(), timeout=20)
+
+        if not resp.ok:
+            print(f"[Screener chart] HTTP {resp.status_code} for {metric} (id={company_id})")
+            return []
+
+        data = resp.json()
+        # Response: {"datasets": [{"label": "P/E", "data": [["Jan 2020", 22.5], ...]}]}
+        datasets = data.get("datasets", [])
+        if not datasets:
+            return []
+
+        points_raw = datasets[0].get("data", [])
+        result = []
+        for point in points_raw:
+            if not isinstance(point, (list, tuple)) or len(point) < 2:
+                continue
+            date_raw, val = point[0], point[1]
+            if val is None:
+                continue
+            try:
+                result.append({"date": _normalize_screener_date(str(date_raw)), "value": float(val)})
+            except (ValueError, TypeError):
+                continue
+        return result
+
+    except Exception as e:
+        print(f"[Screener chart] Error fetching {metric} for id={company_id}: {e}")
+        return []
 
 
 @app.get("/historical/{symbol}")
 def historical_valuation(symbol: str):
     """
-    Return 5Y monthly price history + reconstructed P/E and P/B series.
-    Used by the Historical Valuation Chart on the frontend.
-
-    Logic:
-      - Fetch monthly OHLCV from Yahoo Finance chart API
-      - Fetch annual EPS from incomeStatementHistory
-      - Fetch annual BVPS from balanceSheetHistory
-      - For each monthly price, find trailing EPS/BVPS (most recent FY that ended before that month)
-      - Return points array + percentile stats
+    5Y historical P/E, P/B and Price from Screener.in chart API.
+    100% Screener — no Yahoo Finance dependency.
     """
     symbol = symbol.upper().strip()
     cache_key = f"historical:{symbol}"
@@ -1532,122 +1619,76 @@ def historical_valuation(symbol: str):
     if cached is not None:
         return cached
 
-    ns, _exch = _resolve_ticker(symbol)
-    _ensure_yahoo()
-    if not _YF_SESSION_OBJ or not _YF_CRUMB:
-        raise HTTPException(503, "Yahoo Finance session unavailable")
+    # ── 1. Get Screener page + company ID ────────────────────────────────
+    soup = _fetch_screener_page(symbol)
+    if not soup:
+        raise HTTPException(404, f"Company {symbol} not found on Screener.in")
 
-    # ── 1. Monthly price history (5Y) ──────────────────────────────────────
-    try:
-        chart_resp = _YF_SESSION_OBJ.get(
-            f"{_YF_HOST}/v8/finance/chart/{ns}",
-            params={"range": "5y", "interval": "1mo", "crumb": _YF_CRUMB},
-            timeout=20,
-        )
-        if not chart_resp.ok:
-            raise HTTPException(chart_resp.status_code, f"Chart API error for {ns}")
-        chart_json   = chart_resp.json()
-        chart_result = (chart_json.get("chart") or {}).get("result") or []
-        if not chart_result:
-            raise HTTPException(404, f"No chart data for {ns}")
-        cr         = chart_result[0]
-        timestamps = cr.get("timestamp") or []
-        closes     = (cr.get("indicators") or {}).get("quote", [{}])[0].get("close") or []
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(502, f"Chart fetch failed: {e}")
+    company_id = _get_screener_company_id(soup)
+    if not company_id:
+        raise HTTPException(500, f"Could not find Screener company ID for {symbol}")
 
-    if not timestamps or not closes:
-        raise HTTPException(404, f"Empty chart data for {ns}")
+    print(f"[historical] {symbol}: Screener company_id={company_id}")
 
-    # ── 2. Annual financials (EPS + Book Value) ───────────────────────────
-    try:
-        fin_data = _yf_summary(ns, "incomeStatementHistory,balanceSheetHistory,defaultKeyStatistics")
-    except Exception as e:
-        raise HTTPException(502, f"Financials fetch failed: {e}")
+    # ── 2. Fetch historical series from Screener chart API ────────────────
+    pe_data    = _fetch_screener_chart_api(company_id, "Price-to-Earning", 1825)
+    pb_data    = _fetch_screener_chart_api(company_id, "Price-to-Book",    1825)
+    price_data = _fetch_screener_chart_api(company_id, "Price",            1825)
 
-    ks = fin_data.get("defaultKeyStatistics") or {}
-    so_raw = ks.get("sharesOutstanding")
-    shares = float(so_raw.get("raw", 0) if isinstance(so_raw, dict) else (so_raw or 0))
+    # ── 3. Also parse annual EPS from Screener P&L to reconstruct P/E gaps ─
+    # If chart API has gaps (e.g. stock was unlisted), fill from financials
+    fin_data = _parse_screener_financials(soup)
+    # Build EPS map: {"FY24": 45.2, ...}
+    eps_by_fy = {row["year"]: row["eps"] for row in fin_data if row.get("eps", 0) > 0}
 
-    def rv(d: dict, key: str) -> float:
-        v = d.get(key)
-        if isinstance(v, dict): return safe_val(v.get("raw"))
-        return safe_val(v)
+    # ── 4. Unify into monthly points ─────────────────────────────────────
+    pe_map    = {d["date"]: d["value"] for d in pe_data}
+    pb_map    = {d["date"]: d["value"] for d in pb_data}
+    price_map = {d["date"]: d["value"] for d in price_data}
 
-    # Build EPS timeline: sorted list of (end_timestamp, eps_per_share)
-    eps_timeline: list[tuple[float, float]] = []
-    stmts = (fin_data.get("incomeStatementHistory") or {}).get("incomeStatementHistory") or []
-    for stmt in stmts:
-        end_ts  = (stmt.get("endDate") or {}).get("raw", 0)
-        pat     = rv(stmt, "netIncome")
-        eps_raw = rv(stmt, "basicEPS") or rv(stmt, "dilutedEPS") or rv(stmt, "basicEps") or rv(stmt, "dilutedEps")
-        if not eps_raw and pat and shares > 0:
-            eps_raw = pat / shares
-        if end_ts and eps_raw:
-            eps_timeline.append((float(end_ts), float(eps_raw)))
-    eps_timeline.sort(key=lambda x: x[0])
+    all_dates = sorted(set(list(pe_map) + list(pb_map) + list(price_map)))
 
-    # Build BVPS timeline: sorted list of (end_timestamp, bvps)
-    bvps_timeline: list[tuple[float, float]] = []
-    bs_stmts = (fin_data.get("balanceSheetHistory") or {}).get("balanceSheetStatements") or []
-    for bs in bs_stmts:
-        end_ts = (bs.get("endDate") or {}).get("raw", 0)
-        equity = rv(bs, "totalStockholderEquity")
-        if end_ts and equity and shares > 0:
-            bvps_timeline.append((float(end_ts), float(equity) / shares))
-    bvps_timeline.sort(key=lambda x: x[0])
-
-    def trailing_value(timeline: list[tuple[float, float]], price_ts: float) -> float | None:
-        """Return the most recent value from timeline where end_ts <= price_ts."""
-        result = None
-        for end_ts, val in timeline:
-            if end_ts <= price_ts + 86400 * 90:   # allow 90-day lag for results release
-                result = val
-        return result
-
-    # ── 3. Build monthly data points ──────────────────────────────────────
     points = []
-    for ts, price in zip(timestamps, closes):
-        if price is None or price <= 0:
-            continue
-        date_str = datetime.utcfromtimestamp(ts).strftime("%Y-%m")
-        eps  = trailing_value(eps_timeline,  float(ts))
-        bvps = trailing_value(bvps_timeline, float(ts))
+    for date_str in all_dates:
+        pe_val    = pe_map.get(date_str)
+        pb_val    = pb_map.get(date_str)
+        price_val = price_map.get(date_str)
 
-        pe_val = round(price / eps,  1)  if eps  and eps  > 0 else None
-        pb_val = round(price / bvps, 2)  if bvps and bvps > 0 else None
+        # Sanity caps
+        if pe_val is not None and (pe_val < 0 or pe_val > 500):
+            pe_val = None
+        if pb_val is not None and (pb_val < 0 or pb_val > 100):
+            pb_val = None
 
-        # Sanity cap — extreme outliers skew charts
-        if pe_val and (pe_val < 0 or pe_val > 500):  pe_val  = None
-        if pb_val and (pb_val < 0 or pb_val > 100):  pb_val  = None
-
-        points.append({"date": date_str, "price": round(price, 2), "pe": pe_val, "pb": pb_val})
+        if pe_val or pb_val or price_val:
+            points.append({
+                "date":  date_str,
+                "price": round(price_val, 2) if price_val else None,
+                "pe":    round(pe_val,    1) if pe_val    else None,
+                "pb":    round(pb_val,    2) if pb_val    else None,
+            })
 
     if not points:
-        raise HTTPException(404, "No valid historical data points")
+        raise HTTPException(404, f"No historical data from Screener chart API for {symbol}")
 
-    # ── 4. Statistics ─────────────────────────────────────────────────────
-    def _stats(vals: list[float]) -> dict:
+    # ── 5. Statistics ─────────────────────────────────────────────────────
+    def _stats(vals: list) -> dict:
         if not vals:
             return {"min": 0, "max": 0, "median": 0, "p25": 0, "p75": 0, "mean": 0}
-        sv   = sorted(vals)
-        n    = len(sv)
-        med  = sv[n // 2] if n % 2 else (sv[n // 2 - 1] + sv[n // 2]) / 2
-        p25  = sv[int(n * 0.25)]
-        p75  = sv[int(n * 0.75)]
+        sv = sorted(vals)
+        n  = len(sv)
+        med = sv[n // 2] if n % 2 else (sv[n // 2 - 1] + sv[n // 2]) / 2
         return {
             "min":    round(min(sv), 2),
             "max":    round(max(sv), 2),
-            "median": round(med,     2),
-            "p25":    round(p25,     2),
-            "p75":    round(p75,     2),
+            "median": round(med, 2),
+            "p25":    round(sv[int(n * 0.25)], 2),
+            "p75":    round(sv[int(n * 0.75)], 2),
             "mean":   round(sum(sv) / n, 2),
         }
 
-    pe_vals  = [p["pe"]  for p in points if p["pe"]  is not None]
-    pb_vals  = [p["pb"]  for p in points if p["pb"]  is not None]
+    pe_vals = [p["pe"] for p in points if p["pe"] is not None]
+    pb_vals = [p["pb"] for p in points if p["pb"] is not None]
 
     result = {
         "symbol": symbol,
@@ -1656,8 +1697,11 @@ def historical_valuation(symbol: str):
             "pe": _stats(pe_vals),
             "pb": _stats(pb_vals),
         },
+        "source": "screener",
+        "company_id": company_id,
     }
     _cache_set(cache_key, result)
+    print(f"[historical] {symbol}: {len(points)} points, PE range {pe_vals[0] if pe_vals else '-'}–{pe_vals[-1] if pe_vals else '-'} ✓")
     return result
 
 
@@ -1866,32 +1910,18 @@ def _screener_sym_to_ns(sym: str) -> str:
 
 
 def _parse_screener_peers(soup, self_symbol: str) -> list[str]:
-    """
-    Extract peer tickers from a Screener.in company page.
-    Screener's peer table uses BSE/NSE sector codes — most accurate grouping available.
-    Returns list of Yahoo Finance .NS tickers, excluding self.
-    """
+    """Extract peer symbols (as .NS tickers) from Screener peers section."""
     if not soup or not _BS4_AVAILABLE:
         return []
-
-    peers = []
-    seen = {self_symbol.upper()}
-
+    peers, seen = [], {self_symbol.upper()}
     try:
-        # Screener renders peers in a <section id="peers"> with a table of links
-        peers_section = (
-            soup.find(id="peers")
-            or soup.find("section", id="peers")
-            or soup.find("div", id="peers")
-        )
-        if not peers_section:
+        sec = soup.find(id="peers") or soup.find("section", id="peers") or soup.find("div", id="peers")
+        if not sec:
             return []
-
-        for link in peers_section.find_all("a", href=True):
+        for link in sec.find_all("a", href=True):
             href = link.get("href", "")
             if "/company/" not in href:
                 continue
-            # URL format: /company/SYMBOL/ or /company/SYMBOL/consolidated/
             parts = [p for p in href.strip("/").split("/") if p]
             if not parts or parts[0] != "company":
                 continue
@@ -1902,208 +1932,266 @@ def _parse_screener_peers(soup, self_symbol: str) -> list[str]:
             peers.append(_screener_sym_to_ns(sym))
             if len(peers) >= 12:
                 break
-
     except Exception as e:
         print(f"[Screener peers] parse error for {self_symbol}: {e}")
-
     return peers
+
+
+def _parse_screener_peers_with_metrics(soup, self_symbol: str) -> list[dict]:
+    """
+    Parse Screener's peers table INCLUDING financial metrics.
+    Returns list of peer dicts with symbol, name, price, PE, market cap, ROE, etc.
+    This is 100% Screener-sourced — no Yahoo Finance needed.
+    """
+    if not soup or not _BS4_AVAILABLE:
+        return []
+
+    peers_section = (
+        soup.find(id="peers")
+        or soup.find("section", id="peers")
+        or soup.find("div", id="peers")
+    )
+    if not peers_section:
+        return []
+
+    table = peers_section.find("table")
+    if not table:
+        return []
+
+    # ── Parse column headers ──────────────────────────────────────────────
+    headers = []
+    thead = table.find("thead")
+    if thead:
+        for th in thead.find_all("th"):
+            headers.append(th.get_text(strip=True).lower())
+
+    def col_idx(*keywords):
+        for i, h in enumerate(headers):
+            for kw in keywords:
+                if kw in h:
+                    return i
+        return -1
+
+    name_idx   = 0
+    price_idx  = col_idx("cmp", "price", "ltp")
+    pe_idx     = col_idx("p/e", " pe ")
+    mktcap_idx = col_idx("mar cap", "market cap", "mcap")
+    roe_idx    = col_idx("roe")
+    roce_idx   = col_idx("roce")
+    div_idx    = col_idx("div yld", "dividend yield")
+    netpat_idx = col_idx("np qtr", "net profit", "pat qtr")
+
+    # ── Parse rows ────────────────────────────────────────────────────────
+    result = []
+    seen   = set()
+    self_sym_clean = self_symbol.upper().replace(".NS", "").replace(".BO", "")
+
+    tbody = table.find("tbody")
+    if not tbody:
+        return []
+
+    for tr in tbody.find_all("tr"):
+        cells = tr.find_all("td")
+        if not cells:
+            continue
+        try:
+            # Symbol from link in first cell
+            link = cells[0].find("a", href=True)
+            if not link:
+                continue
+            href  = link.get("href", "")
+            parts = [p for p in href.strip("/").split("/") if p]
+            if not parts or parts[0] != "company":
+                continue
+            sym  = parts[1].upper() if len(parts) > 1 else ""
+            if not sym or sym in seen:
+                continue
+            seen.add(sym)
+
+            name    = link.get_text(strip=True)
+            is_self = sym == self_sym_clean
+
+            def _cell(idx):
+                if idx < 0 or idx >= len(cells):
+                    return None
+                txt = cells[idx].get_text(strip=True).replace(",", "").replace("%", "").strip()
+                if txt in ("", "-", "--", "N/A"):
+                    return None
+                try:
+                    return float(txt)
+                except (ValueError, TypeError):
+                    return None
+
+            price_v  = _cell(price_idx)
+            pe_v     = _cell(pe_idx)
+            mktcap_v = _cell(mktcap_idx)   # ₹ Cr
+            roe_v    = _cell(roe_idx)
+            roce_v   = _cell(roce_idx)
+            div_v    = _cell(div_idx)
+
+            # Sanity caps
+            if pe_v is not None and (pe_v < 0 or pe_v > 500):
+                pe_v = None
+
+            # Derive P/B from price / book value (not directly in table — computed later)
+            result.append({
+                "symbol":       sym,
+                "name":         name,
+                "marketCap":    round(mktcap_v, 0) if mktcap_v else None,
+                "currentPrice": round(price_v, 2)  if price_v  else None,
+                "pe":           round(pe_v, 1)      if pe_v     else None,
+                "pb":           None,               # not in Screener peers table
+                "evEbitda":     None,               # not in Screener peers table
+                "revenueGrowth":None,
+                "netMargin":    None,
+                "roe":          round(roe_v or roce_v, 1) if (roe_v or roce_v) else None,
+                "de":           None,               # not in Screener peers table
+                "isSelf":       is_self,
+            })
+        except Exception:
+            continue
+
+    return result
 
 
 @app.get("/peers/{symbol}")
 def get_peers(symbol: str):
     """
-    Return sector peers with key financial metrics.
-    Fetches metrics for up to 7 peers + the queried company itself.
-    Used by the Peer Compare view on the frontend.
+    Peer comparison — 100% Screener.in. No Yahoo Finance.
+
+    Priority:
+      1. Symbol override (verified correct peers for known stocks)
+      2. Screener peers table WITH metrics (fastest, most accurate)
+      3. Sector/industry fallback from curated maps (if Screener unavailable)
     """
-    symbol = symbol.upper().strip()
+    symbol    = symbol.upper().strip()
     cache_key = f"peers:{symbol}"
-    cached = _cache_get(cache_key)
+    cached    = _cache_get(cache_key)
     if cached is not None:
         return cached
 
-    ns, _exch = _resolve_ticker(symbol)
+    bare = symbol.replace(".NS","").replace(".BO","")
 
-    # ── 1. Get sector for this symbol ─────────────────────────────────────
-    try:
-        profile_data = _yf_summary(ns, "summaryProfile,price,summaryDetail,defaultKeyStatistics,financialData")
-    except Exception as e:
-        raise HTTPException(502, f"Cannot fetch profile for {symbol}: {e}")
+    # ── 1. Fetch Screener page (cached from company-v2 load if already done) ─
+    soup = _fetch_screener_page(symbol)
 
-    sector   = (profile_data.get("summaryProfile") or {}).get("sector", "")
-    industry = (profile_data.get("summaryProfile") or {}).get("industry", "")
-    # Fallback: check our universe map
+    # ── 2. Get sector/industry from Screener ratios ───────────────────────────
+    sector   = ""
+    industry = ""
+    if soup:
+        ratios   = _parse_screener_ratios(soup)
+        sector   = ratios.get("screenerIndustry") or ratios.get("sector") or ""
+        industry = ratios.get("screenerIndustry") or ""
     if not sector:
         sector = (STOCK_UNIVERSE.get(symbol) or {}).get("sector", "")
 
-    # ── 2. Build peer list ────────────────────────────────────────────────
-    # Priority: symbol override > industry-level > Screener.in > sector-level
-    #
-    # WHY override first: Screener uses broad BSE sector codes — MCX (exchange)
-    # sits in "Finance" alongside banks, so Screener returns banks as peers.
-    # Hardcoded overrides are manually verified and always correct for known stocks.
-    # Screener is used as a live fallback for all other companies.
-    bare = symbol.replace(".NS","").replace(".BO","")
+    # ── 3. Build peer list ────────────────────────────────────────────────────
+    results: list[dict] = []
 
-    # 2a. Hardcoded override always wins — verified correct peers for known stocks
+    # 3a. Symbol override always wins (verified correct peers)
     if bare in _SYMBOL_PEER_OVERRIDE:
-        peer_ns_list = _SYMBOL_PEER_OVERRIDE[bare]
-        print(f"[peers] {symbol}: using symbol override → {bare}")
-    elif industry and industry in _INDUSTRY_PEERS:
-        peer_ns_list = _INDUSTRY_PEERS[industry]
-        print(f"[peers] {symbol}: industry='{industry}' → {len(peer_ns_list)} peers")
-    else:
-        # 2b. Try Screener for companies NOT in the override / industry map
-        screener_peers: list[str] = []
-        try:
-            soup = _fetch_screener_page(symbol)
-            if soup:
-                screener_peers = _parse_screener_peers(soup, symbol)
-                print(f"[peers] {symbol}: Screener → {len(screener_peers)} peers: {screener_peers[:5]}")
-        except Exception as sc_err:
-            print(f"[peers] {symbol}: Screener scrape failed: {sc_err}")
+        peer_syms = [p.replace(".NS","").replace(".BO","")
+                     for p in _SYMBOL_PEER_OVERRIDE[bare]
+                     if p.replace(".NS","").replace(".BO","").upper() != bare][:7]
+        print(f"[peers] {symbol}: symbol override → {len(peer_syms)} peers")
 
-        if len(screener_peers) >= 3:
-            peer_ns_list = screener_peers
-            print(f"[peers] {symbol}: using Screener peers ({len(peer_ns_list)} total)")
-        else:
-            peer_ns_list = _SECTOR_PEERS.get(sector, [])
-            print(f"[peers] {symbol}: sector fallback '{sector}' (industry='{industry}' not mapped)")
+        # Build self row from cached company-v2
+        self_cv2 = _cache_get(f"company_v2:{symbol}")
+        if self_cv2:
+            results.append({
+                "symbol": bare,
+                "name": self_cv2.get("name", bare),
+                "marketCap": self_cv2.get("marketCap"),
+                "currentPrice": self_cv2.get("currentPrice"),
+                "pe": self_cv2.get("pe"),
+                "pb": self_cv2.get("pb"),
+                "evEbitda": None, "revenueGrowth": None, "netMargin": None,
+                "roe": self_cv2.get("roe"),
+                "de": self_cv2.get("debtToEquity"),
+                "isSelf": True,
+            })
 
-    # Ensure self is included first; remove self from peers to avoid duplication
-    peers_only = [p for p in peer_ns_list if p.replace(".NS","").replace(".BO","").lower() != bare.lower()][:6]
-    all_symbols = [ns] + peers_only  # self first, then up to 6 peers
+        # Fetch peer company-v2 data (fast — hits same Screener page)
+        for peer_sym in peer_syms:
+            try:
+                peer_cv2 = _cache_get(f"company_v2:{peer_sym}")
+                if not peer_cv2:
+                    peer_soup = _fetch_screener_page(peer_sym)
+                    if peer_soup:
+                        pr = _parse_screener_ratios(peer_soup)
+                        h1 = peer_soup.find("h1")
+                        pname = h1.get_text(strip=True) if h1 else peer_sym
+                        peer_cv2 = {
+                            "name": pname, "pe": pr.get("pe"), "pb": pr.get("pb"),
+                            "roe": pr.get("roe"), "marketCap": pr.get("marketCap"),
+                            "currentPrice": pr.get("currentPrice"),
+                            "debtToEquity": pr.get("debtToEquity"),
+                        }
+                        _cache_set(f"company_v2:{peer_sym}", peer_cv2)
+                if peer_cv2:
+                    results.append({
+                        "symbol": peer_sym,
+                        "name": peer_cv2.get("name", peer_sym),
+                        "marketCap": peer_cv2.get("marketCap"),
+                        "currentPrice": peer_cv2.get("currentPrice"),
+                        "pe": peer_cv2.get("pe"),
+                        "pb": peer_cv2.get("pb"),
+                        "evEbitda": None, "revenueGrowth": None, "netMargin": None,
+                        "roe": peer_cv2.get("roe"),
+                        "de": peer_cv2.get("debtToEquity"),
+                        "isSelf": False,
+                    })
+            except Exception:
+                pass
 
-    # ── 3. Extract metrics from a yf summary result ───────────────────────
-    def _extract_metrics(data: dict, sym_ns: str, is_self: bool) -> dict | None:
-        try:
-            pr  = data.get("price") or {}
-            ks  = data.get("defaultKeyStatistics") or {}
-            fd  = data.get("financialData") or {}
-            sd  = data.get("summaryDetail") or {}
+    # 3b. Screener peers table WITH metrics (live — no symbol override available)
+    elif soup:
+        screener_results = _parse_screener_peers_with_metrics(soup, symbol)
+        if screener_results:
+            # Mark self row
+            for row in screener_results:
+                if row["symbol"] == bare:
+                    row["isSelf"] = True
+            # If self not in screener table, prepend from company-v2
+            has_self = any(r["isSelf"] for r in screener_results)
+            if not has_self:
+                self_cv2 = _cache_get(f"company_v2:{symbol}")
+                if self_cv2:
+                    screener_results.insert(0, {
+                        "symbol": bare, "name": self_cv2.get("name", bare),
+                        "marketCap": self_cv2.get("marketCap"),
+                        "currentPrice": self_cv2.get("currentPrice"),
+                        "pe": self_cv2.get("pe"), "pb": self_cv2.get("pb"),
+                        "evEbitda": None, "revenueGrowth": None, "netMargin": None,
+                        "roe": self_cv2.get("roe"), "de": self_cv2.get("debtToEquity"),
+                        "isSelf": True,
+                    })
+            results = screener_results[:8]
+            print(f"[peers] {symbol}: Screener table → {len(results)} peers ✓")
 
-            def rv(d: dict, key: str):
-                v = d.get(key)
-                if isinstance(v, dict): return v.get("raw")
-                return v
+    # 3c. Curated fallback (Screener unavailable)
+    if not results:
+        peer_ns_list = (
+            _INDUSTRY_PEERS.get(industry, [])
+            or _SECTOR_PEERS.get(sector, [])
+        )
+        peer_syms = [p.replace(".NS","").replace(".BO","")
+                     for p in peer_ns_list
+                     if p.replace(".NS","").replace(".BO","").upper() != bare][:6]
+        for peer_sym in [bare] + peer_syms:
+            cv2 = _cache_get(f"company_v2:{peer_sym}")
+            if cv2:
+                results.append({
+                    "symbol": peer_sym, "name": cv2.get("name", peer_sym),
+                    "marketCap": cv2.get("marketCap"), "currentPrice": cv2.get("currentPrice"),
+                    "pe": cv2.get("pe"), "pb": cv2.get("pb"),
+                    "evEbitda": None, "revenueGrowth": None, "netMargin": None,
+                    "roe": cv2.get("roe"), "de": cv2.get("debtToEquity"),
+                    "isSelf": peer_sym == bare,
+                })
+        print(f"[peers] {symbol}: curated fallback → {len(results)} peers")
 
-            name = rv(pr, "shortName") or rv(pr, "longName") or sym_ns.replace(".NS","").replace(".BO","")
-            ticker = sym_ns.replace(".NS","").replace(".BO","")
-
-            mktcap_raw = rv(pr, "marketCap") or 0
-            price_raw  = rv(pr, "regularMarketPrice") or 0
-
-            pe = rv(sd, "trailingPE") or rv(ks, "trailingPE") or rv(ks, "forwardPE")
-            pb = rv(ks, "priceToBook")
-            ev_ebitda = rv(ks, "enterpriseToEbitda")
-            rev_growth = (rv(fd, "revenueGrowth") or 0) * 100
-            net_margin = (rv(fd, "profitMargins") or 0) * 100
-            roe = (rv(fd, "returnOnEquity") or 0) * 100
-            de  = rv(fd, "debtToEquity")
-
-            # Sanity cap
-            if pe and (pe > 500 or pe < 0): pe = None
-            if pb and (pb > 100 or pb < 0): pb = None
-            if ev_ebitda and (ev_ebitda > 200 or ev_ebitda < 0): ev_ebitda = None
-
-            return {
-                "symbol": ticker,
-                "name": name,
-                "marketCap": round(mktcap_raw / 1e7, 0) if mktcap_raw else None,  # in ₹ Cr
-                "currentPrice": round(price_raw, 1) if price_raw else None,
-                "pe": round(pe, 1) if pe else None,
-                "pb": round(pb, 1) if pb else None,
-                "evEbitda": round(ev_ebitda, 1) if ev_ebitda else None,
-                "revenueGrowth": round(rev_growth, 1) if rev_growth else None,
-                "netMargin": round(net_margin, 1) if net_margin else None,
-                "roe": round(roe, 1) if roe else None,
-                "de": round(de, 1) if de else None,
-                "isSelf": is_self,
-            }
-        except Exception:
-            return None
-
-    # ── 4. Fetch all symbols ──────────────────────────────────────────────
-    results = []
-    for sym_ns in all_symbols:
-        is_self = sym_ns.lower() == ns.lower()
-        try:
-            if is_self:
-                data = profile_data  # already fetched
-            else:
-                time.sleep(0.25)  # small delay to avoid rate limiting
-                data = _yf_summary(sym_ns, "price,summaryDetail,defaultKeyStatistics,financialData")
-            row = _extract_metrics(data, sym_ns, is_self)
-            if row:
-                results.append(row)
-        except Exception:
-            pass  # skip peers that fail
-
-    # ── 5. Compute smart sector label (mirrors sectorModelMap.ts logic) ───────
-    # Maps Yahoo Finance industry → human-readable label shown in the peer table subtitle.
-    _SMART_LABEL_MAP: dict[str, str] = {
-        "Financial Data & Stock Exchanges": "Exchange / Capital Mkt",
-        "Asset Management": "Asset Management",
-        "Insurance—Life": "Life Insurance",
-        "Insurance—Diversified": "Insurance",
-        "Insurance": "Insurance",
-        "Banks—Regional": "Banking",
-        "Banks—Diversified": "Banking",
-        "Mortgage Finance": "Banking / Finance",
-        "Capital Markets": "Capital Markets",
-        "Credit Services": "NBFC / Finance",
-        "Consumer Finance": "NBFC / Finance",
-        "Auto Manufacturers": "Automobile",
-        "Auto Parts": "Auto Ancillary",
-        "Software—Application": "IT Services",
-        "Software—Infrastructure": "IT Services",
-        "Information Technology Services": "IT Services",
-        "Semiconductors": "Semiconductors",
-        "Telecom Services": "Telecom",
-        "Utilities—Regulated Electric": "Power / Utilities",
-        "Utilities—Independent Power Producers": "Power / Utilities",
-        "Oil & Gas Integrated": "Oil & Gas",
-        "Oil & Gas Refining & Marketing": "Oil & Gas",
-        "Oil & Gas E&P": "Oil & Gas",
-        "Steel": "Metal / Steel",
-        "Aluminum": "Metal / Aluminium",
-        "Pharmaceuticals—Diversified": "Pharma",
-        "Drug Manufacturers—General": "Pharma",
-        "Biotechnology": "Pharma / Biotech",
-        "Grocery Stores": "Retail / Consumer",
-        "Department Stores": "Retail / Consumer",
-        "Apparel Retail": "Retail / Consumer",
-        "Specialty Retail": "Retail / Consumer",
-        "Restaurants": "QSR / Restaurants",
-        "Engineering & Construction": "Infrastructure",
-        "Infrastructure Operations": "Infrastructure",
-        "Aerospace & Defense": "Defence / Aerospace",
-        "Real Estate—Development": "Real Estate",
-        "REIT—Diversified": "Real Estate / REIT",
-        "Agricultural Inputs": "Agri / Chemicals",
-        "Specialty Chemicals": "Specialty Chemicals",
-        "Conglomerates": "Diversified / Conglomerate",
-    }
-    # Override by symbol for special cases
-    _SMART_LABEL_SYM: dict[str, str] = {
-        "MCX": "Exchange / Capital Mkt",
-        "BSELTD": "Exchange / Capital Mkt",
-        "CDSL": "Depository / Registrar",
-        "CAMS": "Depository / Registrar",
-        "KFINTECH": "Depository / Registrar",
-        "HDFCAMC": "Asset Management",
-        "NIPPONLIFE": "Asset Management",
-        "ABSLAMC": "Asset Management",
-        "UTIAMC": "Asset Management",
-        "360ONE": "Wealth Management",
-    }
-    smart_label = (
-        _SMART_LABEL_SYM.get(bare)
-        or _SMART_LABEL_MAP.get(industry, "")
-        or sector
-    )
-
-    result = {"sector": smart_label or sector, "industry": industry, "peers": results}
+    result = {"sector": industry or sector, "industry": industry, "peers": results, "source": "screener"}
     _cache_set(cache_key, result)
     return result
 
