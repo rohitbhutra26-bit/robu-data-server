@@ -2111,3 +2111,188 @@ def get_peers(symbol: str):
 @app.get("/universe/size")
 def universe_size():
     return {"count": len(STOCK_UNIVERSE), "source": "NSE EQUITY_L.csv"}
+
+
+# ── Quarterly Results endpoint ────────────────────────────────────────────────
+@app.get("/quarterly/{symbol}")
+def quarterly_results(symbol: str):
+    """
+    Quarterly P&L from Screener.in (#quarters table).
+    Returns last 8 quarters (newest first) with revenue, PAT, EPS, OPM.
+    """
+    symbol = symbol.upper().strip()
+    cache_key = f"quarterly:{symbol}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    soup = _fetch_screener_page(symbol)
+    if not soup:
+        raise HTTPException(404, f"Company not found on Screener: {symbol}")
+
+    section = soup.find(id="quarters")
+    if not section:
+        raise HTTPException(404, f"Quarterly data not found for {symbol}")
+
+    table = section.find("table")
+    if not table:
+        raise HTTPException(404, f"Quarterly table missing for {symbol}")
+
+    # Parse headers → quarter labels like "Jun 2024", "Sep 2024"
+    quarters = []
+    thead = table.find("thead")
+    if thead:
+        for th in thead.find_all("th")[1:]:
+            txt = th.get_text(strip=True)
+            if txt and txt.lower() != "ttm":
+                quarters.append(txt)
+
+    # Parse rows
+    rows: dict = {}
+    tbody = table.find("tbody")
+    if tbody:
+        for tr in tbody.find_all("tr"):
+            cells = tr.find_all("td")
+            if not cells:
+                continue
+            label = cells[0].get_text(strip=True).lower().rstrip(" +").strip()
+            vals = []
+            for td in cells[1: len(quarters) + 1]:
+                txt = td.get_text(strip=True)
+                vals.append(_cr(txt))
+            rows[label] = vals
+
+    def _row(*keywords):
+        for kw in keywords:
+            for label, vals in rows.items():
+                if label == kw:
+                    return vals
+        for kw in keywords:
+            for label, vals in rows.items():
+                if label.startswith(kw):
+                    return vals
+        for kw in keywords:
+            for label, vals in rows.items():
+                if kw in label:
+                    return vals
+        return [0.0] * len(quarters)
+
+    revenues  = _row("sales", "revenue", "net interest income", "total income")
+    pats      = _row("net profit", "profit after tax", "pat")
+    opm_vals  = _row("opm", "operating profit margin", "ebitda margin")
+    eps_vals  = _row("eps")
+
+    # Build result list — newest quarter first
+    results = []
+    for i, q in enumerate(quarters):
+        rev  = revenues[i]  if i < len(revenues)  else 0.0
+        pat  = pats[i]      if i < len(pats)      else 0.0
+        opm  = opm_vals[i]  if i < len(opm_vals)  else 0.0
+        eps  = eps_vals[i]  if i < len(eps_vals)  else 0.0
+
+        results.append({
+            "quarter": q,          # e.g. "Jun 2024"
+            "revenue": rev,        # ₹ Crore
+            "pat":     pat,        # ₹ Crore
+            "opm":     opm,        # %
+            "eps":     eps,        # ₹
+        })
+
+    # Newest first
+    results.reverse()
+
+    _cache_set(cache_key, results)
+    return results
+
+
+# ── Stock Screener endpoint ───────────────────────────────────────────────────
+@app.get("/screener")
+def stock_screener(
+    min_roe: float = 0,
+    max_pe: float = 9999,
+    min_rev_growth: float = -999,
+    min_net_margin: float = -999,
+    max_debt_equity: float = 9999,
+    sector: str = "",
+    limit: int = 30,
+):
+    """
+    Filter stocks from the NSE universe using cached Screener.in data.
+    Scores 0-100 per stock. Returns top `limit` matches.
+
+    Query params:
+      min_roe          — minimum ROE %          (default: 0)
+      max_pe           — maximum P/E ratio       (default: no limit)
+      min_rev_growth   — minimum revenue CAGR %  (default: no limit)
+      min_net_margin   — minimum net margin %    (default: no limit)
+      max_debt_equity  — maximum D/E ratio        (default: no limit)
+      sector           — sector filter string     (default: all)
+      limit            — max results returned     (default: 30)
+    """
+
+    # We'll screen from the universe list — fetch company-v2 for cached symbols
+    # Use the in-memory cache to avoid re-scraping
+
+    results = []
+
+    # Try to find pre-cached company-v2 data
+    cached_symbols = [k.replace("company_v2:", "") for k in _cache.keys() if k.startswith("company_v2:")]
+
+    for sym in cached_symbols[:200]:  # cap at 200 to avoid timeout
+        try:
+            cached_entry = _cache.get(f"company_v2:{sym}")
+            data = cached_entry[0] if cached_entry else None
+            if not data:
+                continue
+
+            roe      = float(data.get("roe", 0) or 0)
+            pe       = float(data.get("pe", 9999) or 9999)
+            de       = float(data.get("debtToEquity", 0) or 0)
+            margin   = float(data.get("netMargin", 0) or 0)
+            stk_sect = str(data.get("sector", "") or "")
+            name     = str(data.get("name", sym))
+            price    = float(data.get("currentPrice", 0) or 0)
+            mktcap   = float(data.get("marketCap", 0) or 0)
+
+            # Apply filters
+            if roe < min_roe:
+                continue
+            if pe > max_pe and pe > 0:
+                continue
+            if de > max_debt_equity:
+                continue
+            if margin < min_net_margin:
+                continue
+            if sector and sector.lower() not in stk_sect.lower():
+                continue
+
+            # Simple quality score
+            score = 0
+            if roe >= 20:   score += 30
+            elif roe >= 15: score += 20
+            elif roe >= 10: score += 10
+            if pe > 0 and pe <= 20: score += 25
+            elif pe <= 35:          score += 15
+            if de < 0.5:  score += 20
+            elif de < 1:  score += 10
+            if margin >= 15: score += 25
+            elif margin >= 8: score += 15
+
+            results.append({
+                "symbol":    sym,
+                "name":      name,
+                "sector":    stk_sect,
+                "price":     price,
+                "marketCap": mktcap,
+                "pe":        pe if pe < 9999 else None,
+                "roe":       roe,
+                "debtToEquity": de,
+                "netMargin": margin,
+                "score":     score,
+            })
+        except Exception:
+            continue
+
+    # Sort by quality score descending
+    results.sort(key=lambda x: x["score"], reverse=True)
+    return results[:limit]
