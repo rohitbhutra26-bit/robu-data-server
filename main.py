@@ -2563,20 +2563,26 @@ def stock_screener_v2(
     )
 
     # Screener.in fields to request in the export
+    # Use actual spaces — requests will URL-encode them correctly as %20
+    # Do NOT use "+" here; requests.params encodes "+" as "%2B" (literal plus),
+    # which makes Screener.in look for a column literally named "Current+Price".
     fields = (
-        "Name,Current+Price,Market+Capitalization,"
-        "Price+to+Earning,Return+on+equity,Return+on+capital+employed,"
-        "Net+profit+margin,Debt+to+equity,Sales+growth+5Years,"
-        "Profit+growth+5Years,Dividend+Yield,Promoter+Holding"
+        "Name,NSE Symbol,Current Price,Market Capitalization,"
+        "Price to Earning,Return on equity,Return on capital employed,"
+        "Net profit margin,Debt to equity,Sales growth 5Years,"
+        "Profit growth 5Years,Dividend Yield,Promoter Holding"
     )
 
     sort_param = f"{sort_by}" if order == "desc" else f"-{sort_by}"
 
-    params = {
-        "sort": sort_param,
-        "query": query,
+    # Build URL manually so we can control encoding exactly
+    import urllib.parse as _up
+    qs = _up.urlencode({
+        "sort":   sort_param,
+        "query":  query,
         "fields": fields,
-    }
+    })
+    url = f"https://www.screener.in/screen/raw/?{qs}"
 
     try:
         sess = _get_screener_session()
@@ -2584,8 +2590,7 @@ def stock_screener_v2(
             raise HTTPException(503, "Screener.in session unavailable")
 
         resp = sess.get(
-            "https://www.screener.in/screen/raw/",
-            params=params,
+            url,
             headers=_make_browser_headers("https://www.screener.in/screens/"),
             timeout=30,
         )
@@ -2596,25 +2601,46 @@ def stock_screener_v2(
             raise HTTPException(resp.status_code, f"Screener.in returned {resp.status_code}")
 
         # Parse CSV response
-        import csv, io
+        import csv, io, re as _re
         text = resp.text.strip()
         if not text:
             return []
 
         reader = csv.DictReader(io.StringIO(text))
+
+        # Build case-insensitive column lookup so minor header variation doesn't break us
+        def _make_col_map(fieldnames):
+            """Return lowercase-stripped → original header mapping."""
+            return {(h or "").lower().strip(): h for h in (fieldnames or [])}
+
         results = []
 
         for i, row in enumerate(reader):
             if i >= limit:
                 break
             try:
+                # Build col map once per first row
+                if i == 0:
+                    col_map = _make_col_map(reader.fieldnames)
+                    print(f"[ROBU] screener-v2 CSV headers: {list(reader.fieldnames or [])[:8]}")
+
+                def _get(key: str) -> str:
+                    """Fetch cell value with flexible case-insensitive key matching."""
+                    # Try exact first
+                    v = row.get(key)
+                    if v is not None:
+                        return v
+                    # Try lowercase match
+                    norm = key.lower().strip()
+                    orig = col_map.get(norm)
+                    return row.get(orig, "") if orig else ""
+
                 def _f(key: str) -> float:
                     """Safe float from CSV cell — handles commas and % signs."""
-                    v = row.get(key, "") or ""
-                    v = v.replace(",", "").replace("%", "").strip()
+                    v = (_get(key) or "").replace(",", "").replace("%", "").strip()
                     return float(v) if v else 0.0
 
-                name   = (row.get("Name") or "").strip()
+                name   = (_get("Name") or "").strip()
                 price  = _f("Current Price")
                 mktcap = _f("Market Capitalization")
                 pe     = _f("Price to Earning")
@@ -2627,15 +2653,22 @@ def stock_screener_v2(
                 div_y  = _f("Dividend Yield")
                 promo  = _f("Promoter Holding")
 
-                # Derive symbol from name — Screener CSV "Name" column is company name
-                # The URL column (if present) contains /company/SYMBOL/ pattern
-                sym_raw = row.get("Symbol") or row.get("NSE Symbol") or ""
+                # Symbol: prefer NSE Symbol column, then URL, then clean name
+                sym_raw = (_get("NSE Symbol") or "").strip()
                 if not sym_raw:
-                    # Attempt to extract from a URL field if Screener provides it
-                    url_field = row.get("URL") or row.get("Link") or ""
-                    import re as _re
+                    url_field = _get("URL") or _get("Link") or ""
                     m = _re.search(r"/company/([^/]+)/", url_field)
-                    sym_raw = m.group(1) if m else name.upper().replace(" ", "")[:10]
+                    if m:
+                        sym_raw = m.group(1).upper()
+                if not sym_raw and name:
+                    # Last-resort: strip common suffixes, capitalise, take first word
+                    clean = name.upper()
+                    for sfx in [" LTD", " LIMITED", " LTD.", " INC", " CORP"]:
+                        clean = clean.replace(sfx, "")
+                    sym_raw = clean.strip().split()[0][:12] if clean.strip() else ""
+
+                if not name and not sym_raw:
+                    continue  # skip completely empty rows
 
                 # Quality score for frontend sorting
                 score = 0
