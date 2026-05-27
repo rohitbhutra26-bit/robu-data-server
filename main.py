@@ -2508,7 +2508,8 @@ def screener_debug():
         sess = _get_screener_session()
         if not sess:
             return {"error": "No session", "url": url}
-        resp = sess.get(url, headers=_make_browser_headers("https://www.screener.in/screens/"), timeout=20)
+        csv_headers = {**_make_browser_headers("https://www.screener.in/screens/"), "Accept": "text/csv,text/plain,*/*"}
+        resp = sess.get(url, headers=csv_headers, timeout=20)
         raw = resp.text[:2000]  # first 2000 chars
         lines = raw.split("\n")
         return {
@@ -2620,16 +2621,18 @@ def stock_screener_v2(
         if not sess:
             raise HTTPException(503, "Screener.in session unavailable")
 
-        resp = sess.get(
-            url,
-            headers=_make_browser_headers("https://www.screener.in/screens/"),
-            timeout=30,
-        )
+        # Must send Accept: text/csv — without it, Screener returns HTML page
+        csv_hdrs = {**_make_browser_headers("https://www.screener.in/screens/"), "Accept": "text/csv,text/plain,*/*"}
+        resp = sess.get(url, headers=csv_hdrs, timeout=30)
 
         if resp.status_code == 429:
             raise HTTPException(429, "Screener.in rate-limited, try again in a moment")
         if not resp.ok:
             raise HTTPException(resp.status_code, f"Screener.in returned {resp.status_code}")
+
+        # Guard: if response is HTML (login redirect), session expired
+        if resp.text.strip().startswith("<!"):
+            raise HTTPException(503, "Screener session expired — please re-deploy to refresh")
 
         # ── Parse CSV ────────────────────────────────────────────────────────
         import csv, io, re as _re
