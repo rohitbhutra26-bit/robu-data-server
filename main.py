@@ -2562,20 +2562,23 @@ def stock_screener_v2(
         min_market_cap, max_market_cap, min_rev_growth, min_roce, sector,
     )
 
-    # Screener.in fields to request in the export
-    # Use actual spaces — requests will URL-encode them correctly as %20
-    # Do NOT use "+" here; requests.params encodes "+" as "%2B" (literal plus),
-    # which makes Screener.in look for a column literally named "Current+Price".
+    # Screener.in fields to request.
+    # Rules:
+    #  1. Use SPACES not "+" — urlencode() will encode them as "+" correctly.
+    #     If we put literal "+" in the string, urlencode encodes it as "%2B"
+    #     and Screener sees "Current%2BPrice" (literal plus) → column not found.
+    #  2. Do NOT include "NSE Symbol" — it's not a valid Screener metric field
+    #     and causes the entire export to return 0 rows.
     fields = (
-        "Name,NSE Symbol,Current Price,Market Capitalization,"
+        "Name,Current Price,Market Capitalization,"
         "Price to Earning,Return on equity,Return on capital employed,"
         "Net profit margin,Debt to equity,Sales growth 5Years,"
         "Profit growth 5Years,Dividend Yield,Promoter Holding"
     )
 
-    sort_param = f"{sort_by}" if order == "desc" else f"-{sort_by}"
+    sort_param = sort_by if order == "desc" else f"-{sort_by}"
 
-    # Build URL manually so we can control encoding exactly
+    # Build URL manually with urlencode so spaces become "+" (standard form encoding)
     import urllib.parse as _up
     qs = _up.urlencode({
         "sort":   sort_param,
@@ -2583,6 +2586,7 @@ def stock_screener_v2(
         "fields": fields,
     })
     url = f"https://www.screener.in/screen/raw/?{qs}"
+    print(f"[ROBU] screener-v2 URL: {url[:200]}")
 
     try:
         sess = _get_screener_session()
@@ -2600,18 +2604,49 @@ def stock_screener_v2(
         if not resp.ok:
             raise HTTPException(resp.status_code, f"Screener.in returned {resp.status_code}")
 
-        # Parse CSV response
+        # ── Parse CSV ────────────────────────────────────────────────────────
         import csv, io, re as _re
         text = resp.text.strip()
         if not text:
             return []
 
+        # Log first line so we can see actual headers in Railway logs
+        first_line = text.split("\n")[0] if "\n" in text else text[:200]
+        print(f"[ROBU] screener-v2 CSV first line: {first_line}")
+
         reader = csv.DictReader(io.StringIO(text))
 
-        # Build case-insensitive column lookup so minor header variation doesn't break us
-        def _make_col_map(fieldnames):
-            """Return lowercase-stripped → original header mapping."""
-            return {(h or "").lower().strip(): h for h in (fieldnames or [])}
+        # Case-insensitive column lookup — Screener may abbreviate some headers
+        col_map: dict[str, str] = {}
+        fieldnames_ready = False
+
+        def _ensure_col_map():
+            nonlocal col_map, fieldnames_ready
+            if not fieldnames_ready and reader.fieldnames:
+                col_map = {(h or "").lower().strip(): h for h in reader.fieldnames}
+                fieldnames_ready = True
+
+        def _get(key: str) -> str:
+            _ensure_col_map()
+            v = row.get(key)
+            if v is not None:
+                return v
+            orig = col_map.get(key.lower().strip())
+            return row.get(orig, "") if orig else ""
+
+        def _f(key: str) -> float:
+            v = (_get(key) or "").replace(",", "").replace("%", "").strip()
+            try:
+                return float(v) if v else 0.0
+            except ValueError:
+                return 0.0
+
+        # Build reverse name→symbol lookup from STOCK_UNIVERSE
+        _name_to_sym: dict[str, str] = {}
+        for _sym, _info in STOCK_UNIVERSE.items():
+            _n = (_info.get("name") or "").lower().strip()
+            if _n:
+                _name_to_sym[_n] = _sym
 
         results = []
 
@@ -2619,26 +2654,7 @@ def stock_screener_v2(
             if i >= limit:
                 break
             try:
-                # Build col map once per first row
-                if i == 0:
-                    col_map = _make_col_map(reader.fieldnames)
-                    print(f"[ROBU] screener-v2 CSV headers: {list(reader.fieldnames or [])[:8]}")
-
-                def _get(key: str) -> str:
-                    """Fetch cell value with flexible case-insensitive key matching."""
-                    # Try exact first
-                    v = row.get(key)
-                    if v is not None:
-                        return v
-                    # Try lowercase match
-                    norm = key.lower().strip()
-                    orig = col_map.get(norm)
-                    return row.get(orig, "") if orig else ""
-
-                def _f(key: str) -> float:
-                    """Safe float from CSV cell — handles commas and % signs."""
-                    v = (_get(key) or "").replace(",", "").replace("%", "").strip()
-                    return float(v) if v else 0.0
+                _ensure_col_map()
 
                 name   = (_get("Name") or "").strip()
                 price  = _f("Current Price")
@@ -2653,22 +2669,20 @@ def stock_screener_v2(
                 div_y  = _f("Dividend Yield")
                 promo  = _f("Promoter Holding")
 
-                # Symbol: prefer NSE Symbol column, then URL, then clean name
-                sym_raw = (_get("NSE Symbol") or "").strip()
-                if not sym_raw:
-                    url_field = _get("URL") or _get("Link") or ""
-                    m = _re.search(r"/company/([^/]+)/", url_field)
-                    if m:
-                        sym_raw = m.group(1).upper()
+                # Symbol resolution:
+                # 1. Try reverse lookup in STOCK_UNIVERSE by name
+                # 2. Fallback: clean the name string
+                sym_raw = _name_to_sym.get(name.lower().strip(), "")
                 if not sym_raw and name:
-                    # Last-resort: strip common suffixes, capitalise, take first word
                     clean = name.upper()
-                    for sfx in [" LTD", " LIMITED", " LTD.", " INC", " CORP"]:
+                    for sfx in [" LTD", " LIMITED", " LTD.", " INC", " CORP",
+                                 " INDUSTRIES", " ENTERPRISES", " SOLUTIONS"]:
                         clean = clean.replace(sfx, "")
-                    sym_raw = clean.strip().split()[0][:12] if clean.strip() else ""
+                    sym_raw = clean.strip().split()[0][:15] if clean.strip() else ""
 
-                if not name and not sym_raw:
-                    continue  # skip completely empty rows
+                # Skip truly empty rows (shouldn't happen but guard it)
+                if not name:
+                    continue
 
                 # Quality score for frontend sorting
                 score = 0
