@@ -302,12 +302,19 @@ def _parse_screener_ratios(soup: Any) -> dict:
                     ratios["roe"] = float(value)
                 elif "debt / equity" in name or "debt/equity" in name:
                     ratios["debtToEquity"] = float(value)
-                elif "high / low" in name or "52 week" in name:
-                    # Format: "3,480 / 1,278" → high=3480, low=1278
-                    parts = raw.replace(",", "").split("/")
+                elif any(p in name for p in ("high / low", "52 week", "52w h/l", "high/low", "wk h/l", "week h/l")):
+                    # Screener formats: "3,480 / 1,278" or "₹3,480 / ₹1,278"
+                    clean = raw.replace(",", "").replace("₹", "").replace("₹", "")
+                    parts = clean.split("/")
                     if len(parts) == 2:
-                        ratios["week52High"] = float(parts[0].strip().replace("₹",""))
-                        ratios["week52Low"]  = float(parts[1].strip().replace("₹",""))
+                        try:
+                            h = float(parts[0].strip())
+                            l = float(parts[1].strip())
+                            if h > 0 and l > 0:
+                                ratios["week52High"] = h
+                                ratios["week52Low"]  = l
+                        except (ValueError, TypeError):
+                            pass
                 elif "face value" in name or "face val" in name:
                     ratios["faceValue"] = float(value)
             except (ValueError, TypeError):
@@ -322,22 +329,32 @@ def _parse_screener_ratios(soup: Any) -> dict:
     # ── Industry from Screener's breadcrumb / tags (more precise than Yahoo) ─
     # Screener shows the industry category in breadcrumb or tag links.
     # e.g.: /screens/industry/commodity-exchanges/ → "Commodity Exchanges"
+    def _looks_like_domain(s: str) -> bool:
+        """Return True if string looks like a website domain (e.g. 'ril.com', 'tata.com')."""
+        import re as _re
+        # Has a dot, no spaces, ends in common TLD
+        return bool(_re.search(r'^[a-zA-Z0-9\-]+\.[a-zA-Z]{2,6}$', s.strip()))
+
     try:
         for a in soup.find_all("a", href=True):
             href = a.get("href", "")
             if "/screens/industry/" in href or "/screens/sector/" in href:
                 label = a.get_text(strip=True)
-                if label and len(label) > 2:
+                if label and len(label) > 2 and not _looks_like_domain(label):
                     ratios["screenerIndustry"] = label
                     break
         # Also check the company info section for sector/industry links
+        # IMPORTANT: skip website domains (e.g. "ril.com" appears in company-links)
         company_info = soup.find(class_="company-links") or soup.find(class_="sub-links")
         if company_info and "screenerIndustry" not in ratios:
             for a in company_info.find_all("a", href=True):
-                label = a.get_text(strip=True)
-                if label and len(label) > 3 and "NSE" not in label and "BSE" not in label:
-                    ratios["screenerIndustry"] = label
-                    break
+                href = a.get("href", "")
+                # Only use links that point to Screener industry/sector pages
+                if "/screens/industry/" in href or "/screens/sector/" in href:
+                    label = a.get_text(strip=True)
+                    if label and len(label) > 3 and not _looks_like_domain(label):
+                        ratios["screenerIndustry"] = label
+                        break
     except Exception:
         pass
 
@@ -350,7 +367,9 @@ def _parse_screener_ratios(soup: Any) -> dict:
             if sector_parent:
                 nxt = sector_parent.find_next_sibling()
                 if nxt:
-                    ratios["sector"] = nxt.get_text(strip=True)
+                    raw_sector = nxt.get_text(strip=True)
+                    if raw_sector and not _looks_like_domain(raw_sector):
+                        ratios["sector"] = raw_sector
 
     # Fallback: meta description
     if "sector" not in ratios:
@@ -674,52 +693,30 @@ _exchange_cache: dict[str, tuple[str, str]] = {}
 
 def _resolve_ticker(symbol: str) -> tuple[str, str]:
     """
-    Return (yf_ticker, exchange) for a symbol.
-    If the .NS ticker has no price data, automatically retries with .BO.
-    This fixes BSE-only stocks (e.g. RATNABHUMI, many SME / small caps).
-
-    Result is cached in _exchange_cache so the extra probe only happens once.
+    Return (ticker_string, exchange) for a symbol.
+    Pure universe-based — does NOT call Yahoo Finance.
+    Exchange detection order:
+      1. Cached result from previous call
+      2. Known BSE stock (numeric code, or yf_ticker ends in .BO, or exchange="BSE")
+      3. Default → NSE (.NS)
     Returns: (ticker_string, "NSE" | "BSE")
     """
     if symbol in _exchange_cache:
         return _exchange_cache[symbol]
 
     initial = _get_yf_ticker(symbol)
-    # If already known as BSE from universe, return early
-    info = STOCK_UNIVERSE.get(symbol, {})
-    if info.get("yf_ticker", "").endswith(".BO") or symbol.isdigit():
+    info    = STOCK_UNIVERSE.get(symbol, {})
+
+    is_bse = (
+        symbol.isdigit()
+        or info.get("exchange", "").upper() == "BSE"
+        or info.get("yf_ticker", "").endswith(".BO")
+    )
+
+    if is_bse:
         _exchange_cache[symbol] = (initial, "BSE")
         return initial, "BSE"
 
-    # Check if the .NS ticker actually has price data
-    try:
-        ns_data = _yf_summary(initial, "price")
-        pr = ns_data.get("price") or {}
-        price_val = pr.get("regularMarketPrice")
-        if isinstance(price_val, dict):
-            price_val = price_val.get("raw")
-        if price_val and float(price_val) > 0:
-            _exchange_cache[symbol] = (initial, "NSE")
-            return initial, "NSE"
-    except Exception:
-        pass
-
-    # .NS had no data → try .BO (BSE-only listed stock)
-    bo_ticker = f"{symbol}.BO"
-    try:
-        bo_data = _yf_summary(bo_ticker, "price")
-        pr = bo_data.get("price") or {}
-        price_val = pr.get("regularMarketPrice")
-        if isinstance(price_val, dict):
-            price_val = price_val.get("raw")
-        if price_val and float(price_val) > 0:
-            print(f"[ticker] {symbol}: .NS had no data → resolved to BSE (.BO)")
-            _exchange_cache[symbol] = (bo_ticker, "BSE")
-            return bo_ticker, "BSE"
-    except Exception:
-        pass
-
-    # Both failed — return .NS as default (company endpoint will raise 404)
     _exchange_cache[symbol] = (initial, "NSE")
     return initial, "NSE"
 
@@ -1505,27 +1502,65 @@ def price(symbol: str):
 # ---------------------------------------------------------------------------
 
 def _get_screener_company_id(soup) -> str | None:
-    """Extract Screener.in numeric company ID from the parsed company page."""
+    """Extract Screener.in numeric company ID from the parsed company page.
+
+    Tries multiple extraction methods in order. Screener uses the company ID in
+    the chart API URL (/api/company/<ID>/chart/) and as data-id on several elements.
+    """
     if not soup:
         return None
-    # Method 1: data-id on #company-graph div (most common)
+
+    # Method 1: data-id on any element (most reliable — Screener adds it to several divs)
     for el in soup.find_all(attrs={"data-id": True}):
         val = str(el.get("data-id", "")).strip()
         if val.isdigit() and len(val) >= 2:
             return val
-    # Method 2: JavaScript variable in script tags
-    for script in soup.find_all("script"):
-        text = script.string or ""
-        m = re.search(r'(?:companyId|company_id|data-id)["\']?\s*[:=]\s*["\']?(\d+)', text)
+
+    # Method 2: data-company-id attribute (alternate attribute name)
+    for el in soup.find_all(attrs={"data-company-id": True}):
+        val = str(el.get("data-company-id", "")).strip()
+        if val.isdigit() and len(val) >= 2:
+            return val
+
+    # Method 3: chart API URL in anchor hrefs or src attributes
+    # e.g. href="/api/company/12345/chart/" or src="/api/company/12345/chart/"
+    for a in soup.find_all(href=True):
+        m = re.search(r'/api/company/(\d+)/', a.get("href", ""))
         if m:
             return m.group(1)
-    # Method 3: embedded in a form or hidden input
+
+    # Method 4: JavaScript variable in inline script tags
+    for script in soup.find_all("script"):
+        text = script.string or ""
+        # Pattern: companyId: 12345  or  company_id = "12345"  or  "companyId":"12345"
+        m = re.search(r'(?:companyId|company_id|"id"|\'id\')["\']?\s*[:=]\s*["\']?(\d{3,6})', text)
+        if m:
+            return m.group(1)
+        # Also look for chart API URL in JS: url: '/api/company/12345/chart/'
+        m = re.search(r'/api/company/(\d+)/chart', text)
+        if m:
+            return m.group(1)
+
+    # Method 5: hidden input fields
     for inp in soup.find_all("input", {"type": "hidden"}):
         name = inp.get("name", "").lower()
-        if "company" in name or "id" == name:
+        if "company" in name or name == "id":
             val = str(inp.get("value", "")).strip()
-            if val.isdigit():
+            if val.isdigit() and len(val) >= 2:
                 return val
+
+    # Method 6: canonical URL or og:url meta tag — Screener uses /company/<ID>/ format
+    for meta in soup.find_all("meta"):
+        content = meta.get("content", "")
+        m = re.search(r'/company/(\d+)/', content)
+        if m:
+            return m.group(1)
+    canonical = soup.find("link", {"rel": "canonical"})
+    if canonical:
+        m = re.search(r'/company/(\d+)/', canonical.get("href", ""))
+        if m:
+            return m.group(1)
+
     return None
 
 
@@ -1886,6 +1921,80 @@ _SYMBOL_PEER_OVERRIDE: dict[str, list[str]] = {
     "MPHASIS":    ["MPHASIS.NS","LTIM.NS","PERSISTENT.NS","COFORGE.NS","KPITTECH.NS","INFY.NS","WIPRO.NS"],
     "PERSISTENT": ["PERSISTENT.NS","COFORGE.NS","LTIM.NS","MPHASIS.NS","KPITTECH.NS","TECHM.NS"],
     "COFORGE":    ["COFORGE.NS","PERSISTENT.NS","LTIM.NS","MPHASIS.NS","KPITTECH.NS","TECHM.NS"],
+
+    # ── Energy / Oil & Gas ────────────────────────────────────────────────────
+    "RELIANCE":   ["ONGC.NS","IOC.NS","BPCL.NS","HPCL.NS","GAIL.NS","BHARTIARTL.NS","ADANIENT.NS","LT.NS","VEDL.NS"],
+    "ONGC":       ["ONGC.NS","RELIANCE.NS","IOC.NS","BPCL.NS","HPCL.NS","GAIL.NS","OIL.NS"],
+    "IOC":        ["IOC.NS","BPCL.NS","HPCL.NS","ONGC.NS","RELIANCE.NS","GAIL.NS","MRPL.NS"],
+    "BPCL":       ["BPCL.NS","IOC.NS","HPCL.NS","ONGC.NS","RELIANCE.NS","MRPL.NS"],
+    "HPCL":       ["HPCL.NS","BPCL.NS","IOC.NS","ONGC.NS","RELIANCE.NS","MRPL.NS"],
+    "GAIL":       ["GAIL.NS","IGL.NS","MGL.NS","PETRONET.NS","ONGC.NS","RELIANCE.NS"],
+
+    # ── Conglomerates / Infrastructure ───────────────────────────────────────
+    "ADANIENT":   ["ADANIENT.NS","RELIANCE.NS","LT.NS","ADANIPORTS.NS","ADANITRANS.NS","VEDL.NS"],
+    "LT":         ["LT.NS","SIEMENS.NS","ABB.NS","BHEL.NS","ADANIENT.NS","THERMAX.NS","POWERINDIA.NS"],
+    "ITC":        ["ITC.NS","HINDUNILVR.NS","NESTLEIND.NS","BRITANNIA.NS","DABUR.NS","EMAMILTD.NS","GODREJCP.NS"],
+
+    # ── FMCG ──────────────────────────────────────────────────────────────────
+    "HINDUNILVR": ["HINDUNILVR.NS","ITC.NS","NESTLEIND.NS","BRITANNIA.NS","DABUR.NS","EMAMILTD.NS","GODREJCP.NS","MARICO.NS"],
+    "NESTLEIND":  ["NESTLEIND.NS","HINDUNILVR.NS","BRITANNIA.NS","ITC.NS","DABUR.NS","MARICO.NS","TATACONSUM.NS"],
+    "BRITANNIA":  ["BRITANNIA.NS","HINDUNILVR.NS","NESTLEIND.NS","ITC.NS","DABUR.NS","TATACONSUM.NS"],
+    "DABUR":      ["DABUR.NS","HINDUNILVR.NS","EMAMILTD.NS","GODREJCP.NS","MARICO.NS","COLPAL.NS"],
+    "MARICO":     ["MARICO.NS","DABUR.NS","HINDUNILVR.NS","EMAMILTD.NS","GODREJCP.NS","COLPAL.NS"],
+    "COLPAL":     ["COLPAL.NS","DABUR.NS","MARICO.NS","HINDUNILVR.NS","EMAMILTD.NS","GODREJCP.NS"],
+    "GODREJCP":   ["GODREJCP.NS","HINDUNILVR.NS","DABUR.NS","MARICO.NS","EMAMILTD.NS","COLPAL.NS"],
+    "TATACONSUM": ["TATACONSUM.NS","HINDUNILVR.NS","ITC.NS","NESTLEIND.NS","BRITANNIA.NS","DABUR.NS"],
+
+    # ── Paints ────────────────────────────────────────────────────────────────
+    "ASIANPAINT":   ["ASIANPAINT.NS","BERGERPAINTS.NS","KANSAINER.NS","INDIGO.NS","AKZOINDIA.NS"],
+    "BERGERPAINTS": ["BERGERPAINTS.NS","ASIANPAINT.NS","KANSAINER.NS","INDIGO.NS","AKZOINDIA.NS"],
+    "KANSAINER":    ["KANSAINER.NS","ASIANPAINT.NS","BERGERPAINTS.NS","INDIGO.NS","AKZOINDIA.NS"],
+
+    # ── Metals ────────────────────────────────────────────────────────────────
+    "TATASTEEL":  ["TATASTEEL.NS","JSWSTEEL.NS","HINDALCO.NS","VEDL.NS","SAIL.NS","NMDC.NS","JINDALSTEL.NS"],
+    "JSWSTEEL":   ["JSWSTEEL.NS","TATASTEEL.NS","HINDALCO.NS","VEDL.NS","SAIL.NS","JINDALSTEL.NS"],
+    "HINDALCO":   ["HINDALCO.NS","VEDL.NS","TATASTEEL.NS","JSWSTEEL.NS","NMDC.NS","NALCO.NS"],
+    "VEDL":       ["VEDL.NS","HINDALCO.NS","TATASTEEL.NS","JSWSTEEL.NS","NMDC.NS","COALINDIA.NS"],
+    "COALINDIA":  ["COALINDIA.NS","NMDC.NS","VEDL.NS","HINDALCO.NS","HINDCOPPER.NS"],
+    "SAIL":       ["SAIL.NS","TATASTEEL.NS","JSWSTEEL.NS","JINDALSTEL.NS","RINL.NS","RATNAMANI.NS"],
+
+    # ── Power / Utilities ─────────────────────────────────────────────────────
+    "NTPC":       ["NTPC.NS","POWERGRID.NS","TATAPOWER.NS","ADANIGREEN.NS","TORNTPOWER.NS","CESC.NS"],
+    "POWERGRID":  ["POWERGRID.NS","NTPC.NS","TATAPOWER.NS","ADANIPOWER.NS","ADANIENT.NS"],
+    "TATAPOWER":  ["TATAPOWER.NS","NTPC.NS","POWERGRID.NS","ADANIGREEN.NS","TORNTPOWER.NS","CESC.NS"],
+    "ADANIGREEN": ["ADANIGREEN.NS","NTPC.NS","TATAPOWER.NS","SJVN.NS","NHPC.NS","TORNTPOWER.NS"],
+    "ADANIPOWER": ["ADANIPOWER.NS","NTPC.NS","TATAPOWER.NS","POWERGRID.NS","CESC.NS"],
+    "CESC":       ["CESC.NS","TATAPOWER.NS","NTPC.NS","TORNTPOWER.NS","ADANIPOWER.NS"],
+
+    # ── Pharma ────────────────────────────────────────────────────────────────
+    "SUNPHARMA":  ["SUNPHARMA.NS","DRREDDY.NS","CIPLA.NS","DIVISLAB.NS","AUROPHARMA.NS","LUPIN.NS","ALKEM.NS"],
+    "DRREDDY":    ["DRREDDY.NS","SUNPHARMA.NS","CIPLA.NS","DIVISLAB.NS","AUROPHARMA.NS","LUPIN.NS"],
+    "CIPLA":      ["CIPLA.NS","SUNPHARMA.NS","DRREDDY.NS","DIVISLAB.NS","LUPIN.NS","AUROPHARMA.NS","ALKEM.NS"],
+    "DIVISLAB":   ["DIVISLAB.NS","SUNPHARMA.NS","DRREDDY.NS","CIPLA.NS","LUPIN.NS","AUROPHARMA.NS"],
+    "LUPIN":      ["LUPIN.NS","SUNPHARMA.NS","DRREDDY.NS","CIPLA.NS","AUROPHARMA.NS","ALKEM.NS"],
+    "AUROPHARMA": ["AUROPHARMA.NS","SUNPHARMA.NS","DRREDDY.NS","CIPLA.NS","LUPIN.NS","ALKEM.NS"],
+
+    # ── Cement ────────────────────────────────────────────────────────────────
+    "ULTRACEMCO":  ["ULTRACEMCO.NS","AMBUJACEM.NS","ACC.NS","SHREECEM.NS","RAMCOCEM.NS","JKCEMENT.NS"],
+    "AMBUJACEM":   ["AMBUJACEM.NS","ULTRACEMCO.NS","ACC.NS","SHREECEM.NS","RAMCOCEM.NS"],
+    "ACC":         ["ACC.NS","AMBUJACEM.NS","ULTRACEMCO.NS","SHREECEM.NS","RAMCOCEM.NS","JKCEMENT.NS"],
+    "SHREECEM":    ["SHREECEM.NS","ULTRACEMCO.NS","AMBUJACEM.NS","ACC.NS","RAMCOCEM.NS"],
+
+    # ── Telecom ───────────────────────────────────────────────────────────────
+    "BHARTIARTL":  ["BHARTIARTL.NS","RELIANCE.NS","INDUSTOWER.NS","IDEA.NS","TATACOMM.NS","HFCL.NS"],
+    "INDUSTOWER":  ["INDUSTOWER.NS","BHARTIARTL.NS","GTPL.NS","TATACOMM.NS"],
+
+    # ── Speciality Chemicals ──────────────────────────────────────────────────
+    "SRF":         ["SRF.NS","AAVAS.NS","DEEPAKNITR.NS","NAVINFLUOR.NS","CLEAN.NS","TATACHEM.NS","PCBL.NS"],
+    "DEEPAKNITR":  ["DEEPAKNITR.NS","SRF.NS","NAVINFLUOR.NS","TATACHEM.NS","CLEAN.NS","PCBL.NS"],
+
+    # ── Consumer Durables / Electronics ──────────────────────────────────────
+    "HAVELLS":    ["HAVELLS.NS","VGUARD.NS","CROMPTON.NS","POLYCAB.NS","KEI.NS","ORIENT.NS"],
+    "POLYCAB":    ["POLYCAB.NS","HAVELLS.NS","KEI.NS","VGUARD.NS","CROMPTON.NS"],
+
+    # ── Real Estate ───────────────────────────────────────────────────────────
+    "DLF":        ["DLF.NS","GODREJPROP.NS","OBEROIRLTY.NS","PHOENIXLTD.NS","PRESTIGE.NS","BRIGADE.NS"],
+    "GODREJPROP": ["GODREJPROP.NS","DLF.NS","OBEROIRLTY.NS","PHOENIXLTD.NS","PRESTIGE.NS"],
 }
 
 # ---------------------------------------------------------------------------
@@ -2384,3 +2493,185 @@ def stock_screener(
     # Sort by quality score descending
     results.sort(key=lambda x: x["score"], reverse=True)
     return results[:limit]
+
+
+# ---------------------------------------------------------------------------
+# /screener-v2  — powered by Screener.in's raw export (entire NSE universe)
+# ---------------------------------------------------------------------------
+
+def _build_screener_query(
+    min_roe: float,
+    max_pe: float,
+    min_net_margin: float,
+    max_debt_equity: float,
+    min_market_cap: float,
+    max_market_cap: float,
+    min_rev_growth: float,
+    min_roce: float,
+    sector: str,
+) -> str:
+    """Build a Screener.in query string from filter params."""
+    parts = []
+    if min_roe > 0:
+        parts.append(f"Return on equity > {min_roe}")
+    if max_pe < 9999:
+        parts.append(f"Price to Earning < {max_pe}")
+    if min_net_margin > -999:
+        parts.append(f"Net profit margin > {min_net_margin}")
+    if max_debt_equity < 9999:
+        parts.append(f"Debt to equity < {max_debt_equity}")
+    if min_market_cap > 0:
+        parts.append(f"Market Capitalization > {min_market_cap}")
+    if max_market_cap < 9999999:
+        parts.append(f"Market Capitalization < {max_market_cap}")
+    if min_rev_growth > -999:
+        parts.append(f"Sales growth 5Years > {min_rev_growth}")
+    if min_roce > 0:
+        parts.append(f"Return on capital employed > {min_roce}")
+    if sector:
+        parts.append(f"Sector = {sector}")
+    return " AND ".join(parts) if parts else "Return on equity > 0"
+
+
+@app.get("/screener-v2")
+def stock_screener_v2(
+    min_roe: float = 0,
+    max_pe: float = 9999,
+    min_net_margin: float = -999,
+    max_debt_equity: float = 9999,
+    min_market_cap: float = 0,          # in ₹ Crore
+    max_market_cap: float = 9999999,
+    min_rev_growth: float = -999,       # 5-year sales CAGR %
+    min_roce: float = 0,
+    sector: str = "",
+    sort_by: str = "Market Capitalization",  # Screener column to sort by
+    order: str = "desc",
+    limit: int = 50,
+):
+    """
+    Screen ALL NSE/BSE stocks using Screener.in's raw export API.
+    Returns up to `limit` matching stocks with full metrics.
+
+    Query params:
+      min_roe, max_pe, min_net_margin, max_debt_equity,
+      min_market_cap, max_market_cap, min_rev_growth, min_roce,
+      sector, sort_by, order, limit
+    """
+    query = _build_screener_query(
+        min_roe, max_pe, min_net_margin, max_debt_equity,
+        min_market_cap, max_market_cap, min_rev_growth, min_roce, sector,
+    )
+
+    # Screener.in fields to request in the export
+    fields = (
+        "Name,Current+Price,Market+Capitalization,"
+        "Price+to+Earning,Return+on+equity,Return+on+capital+employed,"
+        "Net+profit+margin,Debt+to+equity,Sales+growth+5Years,"
+        "Profit+growth+5Years,Dividend+Yield,Promoter+Holding"
+    )
+
+    sort_param = f"{sort_by}" if order == "desc" else f"-{sort_by}"
+
+    params = {
+        "sort": sort_param,
+        "query": query,
+        "fields": fields,
+    }
+
+    try:
+        sess = _get_screener_session()
+        if not sess:
+            raise HTTPException(503, "Screener.in session unavailable")
+
+        resp = sess.get(
+            "https://www.screener.in/screen/raw/",
+            params=params,
+            headers=_make_browser_headers("https://www.screener.in/screens/"),
+            timeout=30,
+        )
+
+        if resp.status_code == 429:
+            raise HTTPException(429, "Screener.in rate-limited, try again in a moment")
+        if not resp.ok:
+            raise HTTPException(resp.status_code, f"Screener.in returned {resp.status_code}")
+
+        # Parse CSV response
+        import csv, io
+        text = resp.text.strip()
+        if not text:
+            return []
+
+        reader = csv.DictReader(io.StringIO(text))
+        results = []
+
+        for i, row in enumerate(reader):
+            if i >= limit:
+                break
+            try:
+                def _f(key: str) -> float:
+                    """Safe float from CSV cell — handles commas and % signs."""
+                    v = row.get(key, "") or ""
+                    v = v.replace(",", "").replace("%", "").strip()
+                    return float(v) if v else 0.0
+
+                name   = (row.get("Name") or "").strip()
+                price  = _f("Current Price")
+                mktcap = _f("Market Capitalization")
+                pe     = _f("Price to Earning")
+                roe    = _f("Return on equity")
+                roce   = _f("Return on capital employed")
+                margin = _f("Net profit margin")
+                de     = _f("Debt to equity")
+                rev_g  = _f("Sales growth 5Years")
+                pat_g  = _f("Profit growth 5Years")
+                div_y  = _f("Dividend Yield")
+                promo  = _f("Promoter Holding")
+
+                # Derive symbol from name — Screener CSV "Name" column is company name
+                # The URL column (if present) contains /company/SYMBOL/ pattern
+                sym_raw = row.get("Symbol") or row.get("NSE Symbol") or ""
+                if not sym_raw:
+                    # Attempt to extract from a URL field if Screener provides it
+                    url_field = row.get("URL") or row.get("Link") or ""
+                    import re as _re
+                    m = _re.search(r"/company/([^/]+)/", url_field)
+                    sym_raw = m.group(1) if m else name.upper().replace(" ", "")[:10]
+
+                # Quality score for frontend sorting
+                score = 0
+                if roe >= 20:   score += 30
+                elif roe >= 15: score += 20
+                elif roe >= 10: score += 10
+                if pe > 0 and pe <= 20:  score += 25
+                elif 0 < pe <= 35:       score += 15
+                if de < 0.5:  score += 20
+                elif de < 1:  score += 10
+                if margin >= 15: score += 25
+                elif margin >= 8: score += 15
+
+                results.append({
+                    "symbol":       sym_raw,
+                    "name":         name,
+                    "price":        price,
+                    "marketCap":    mktcap,
+                    "pe":           pe if pe > 0 else None,
+                    "roe":          roe,
+                    "roce":         roce,
+                    "netMargin":    margin,
+                    "debtToEquity": de,
+                    "revenueGrowth5Y": rev_g,
+                    "patGrowth5Y":  pat_g,
+                    "dividendYield": div_y,
+                    "promoterHolding": promo,
+                    "score":        score,
+                })
+            except Exception:
+                continue
+
+        return results
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[ROBU] screener-v2 error: {e}")
+        raise HTTPException(500, f"Screener error: {str(e)}")
