@@ -2496,6 +2496,32 @@ def stock_screener(
 
 
 # ---------------------------------------------------------------------------
+# /screener-debug  — returns raw Screener.in CSV so we can inspect headers
+# ---------------------------------------------------------------------------
+@app.get("/screener-debug")
+def screener_debug():
+    """Hit Screener.in with a minimal query and return the raw CSV text + headers."""
+    import urllib.parse as _up
+    fields_encoded = "Name,Current+Price,Market+Capitalization,Price+to+Earning,Return+on+equity,Net+profit+margin"
+    url = f"https://www.screener.in/screen/raw/?sort=Market+Capitalization&query=Return+on+equity+%3E+15&fields={fields_encoded}"
+    try:
+        sess = _get_screener_session()
+        if not sess:
+            return {"error": "No session", "url": url}
+        resp = sess.get(url, headers=_make_browser_headers("https://www.screener.in/screens/"), timeout=20)
+        raw = resp.text[:2000]  # first 2000 chars
+        lines = raw.split("\n")
+        return {
+            "status":      resp.status_code,
+            "url":         url,
+            "first_line":  lines[0] if lines else "",
+            "second_line": lines[1] if len(lines) > 1 else "",
+            "raw_preview": raw,
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+# ---------------------------------------------------------------------------
 # /screener-v2  — powered by Screener.in's raw export (entire NSE universe)
 # ---------------------------------------------------------------------------
 
@@ -2562,31 +2588,32 @@ def stock_screener_v2(
         min_market_cap, max_market_cap, min_rev_growth, min_roce, sector,
     )
 
-    # Screener.in fields to request.
-    # Rules:
-    #  1. Use SPACES not "+" — urlencode() will encode them as "+" correctly.
-    #     If we put literal "+" in the string, urlencode encodes it as "%2B"
-    #     and Screener sees "Current%2BPrice" (literal plus) → column not found.
-    #  2. Do NOT include "NSE Symbol" — it's not a valid Screener metric field
-    #     and causes the entire export to return 0 rows.
-    fields = (
-        "Name,Current Price,Market Capitalization,"
-        "Price to Earning,Return on equity,Return on capital employed,"
-        "Net profit margin,Debt to equity,Sales growth 5Years,"
-        "Profit growth 5Years,Dividend Yield,Promoter Holding"
-    )
+    # ── Build Screener.in URL ─────────────────────────────────────────────────
+    # Screener.in's raw export expects:
+    #   fields=Name,Current+Price,Market+Capitalization,...
+    #   ↑ commas MUST be literal (not %2C), spaces MUST be "+" (not %20 or %2B)
+    #
+    # We build the URL manually to guarantee this exact encoding.
+    # Using requests.params or urlencode() both URL-encode commas as %2C which
+    # may cause Screener to treat the entire fields string as one field name.
+    import urllib.parse as _up
+    import re as _re
+
+    field_list = [
+        "Name", "Current Price", "Market Capitalization",
+        "Price to Earning", "Return on equity", "Return on capital employed",
+        "Net profit margin", "Debt to equity", "Sales growth 5Years",
+        "Profit growth 5Years", "Dividend Yield", "Promoter Holding",
+    ]
+    # Each field: spaces→+, everything else URL-encoded
+    fields_encoded = ",".join(_up.quote(f, safe="") .replace("%20", "+") for f in field_list)
 
     sort_param = sort_by if order == "desc" else f"-{sort_by}"
+    sort_enc   = _up.quote(sort_param, safe="").replace("%20", "+")
+    query_enc  = _up.quote(query,      safe="").replace("%20", "+")
 
-    # Build URL manually with urlencode so spaces become "+" (standard form encoding)
-    import urllib.parse as _up
-    qs = _up.urlencode({
-        "sort":   sort_param,
-        "query":  query,
-        "fields": fields,
-    })
-    url = f"https://www.screener.in/screen/raw/?{qs}"
-    print(f"[ROBU] screener-v2 URL: {url[:200]}")
+    url = f"https://www.screener.in/screen/raw/?sort={sort_enc}&query={query_enc}&fields={fields_encoded}"
+    print(f"[ROBU] screener-v2 URL: {url[:300]}")
 
     try:
         sess = _get_screener_session()
