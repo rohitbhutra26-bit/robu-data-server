@@ -2621,51 +2621,54 @@ def stock_screener_v2(
         if not sess:
             raise HTTPException(503, "Screener.in session unavailable")
 
-        # Must send Accept: text/csv — without it, Screener returns HTML page
-        csv_hdrs = {**_make_browser_headers("https://www.screener.in/screens/"), "Accept": "text/csv,text/plain,*/*"}
-        resp = sess.get(url, headers=csv_hdrs, timeout=30)
+        # Screener.in always returns HTML (ignores Accept header) — parse HTML table
+        hdrs = _make_browser_headers("https://www.screener.in/screens/")
+        resp = sess.get(url, headers=hdrs, timeout=30)
 
         if resp.status_code == 429:
             raise HTTPException(429, "Screener.in rate-limited, try again in a moment")
         if not resp.ok:
             raise HTTPException(resp.status_code, f"Screener.in returned {resp.status_code}")
 
-        # Guard: if response is HTML (login redirect), session expired
-        if resp.text.strip().startswith("<!"):
+        # ── Parse HTML table (Screener always returns HTML, never CSV) ──────────
+        html = resp.text
+        print(f"[ROBU] screener-v2 response length={len(html)}, starts={html.strip()[:80]}")
+
+        if not _BS4_AVAILABLE:
+            raise HTTPException(503, "beautifulsoup4 not installed on server")
+
+        soup = BeautifulSoup(html, "lxml")
+
+        # Check for login redirect (unauthenticated)
+        login_form = soup.find("form", {"action": re.compile(r"/login", re.I)})
+        if login_form:
             raise HTTPException(503, "Screener session expired — please re-deploy to refresh")
 
-        # ── Parse CSV ────────────────────────────────────────────────────────
-        import csv, io, re as _re
-        text = resp.text.strip()
-        if not text:
+        # Find the results table — Screener uses class "data-table"
+        table = soup.find("table", {"class": "data-table"})
+        if not table:
+            # Try any table as fallback
+            table = soup.find("table")
+        if not table:
+            print(f"[ROBU] screener-v2: no table found in HTML. Title={soup.title and soup.title.text}")
             return []
 
-        # Log first line so we can see actual headers in Railway logs
-        first_line = text.split("\n")[0] if "\n" in text else text[:200]
-        print(f"[ROBU] screener-v2 CSV first line: {first_line}")
+        # Extract headers
+        thead = table.find("thead")
+        headers = []
+        if thead:
+            headers = [th.get_text(strip=True) for th in thead.find_all("th")]
+        print(f"[ROBU] screener-v2 headers: {headers}")
 
-        reader = csv.DictReader(io.StringIO(text))
+        def _col(cells_dict: dict, *keys: str) -> str:
+            for k in keys:
+                v = cells_dict.get(k, "")
+                if v:
+                    return v
+            return ""
 
-        # Case-insensitive column lookup — Screener may abbreviate some headers
-        col_map: dict[str, str] = {}
-        fieldnames_ready = False
-
-        def _ensure_col_map():
-            nonlocal col_map, fieldnames_ready
-            if not fieldnames_ready and reader.fieldnames:
-                col_map = {(h or "").lower().strip(): h for h in reader.fieldnames}
-                fieldnames_ready = True
-
-        def _get(key: str) -> str:
-            _ensure_col_map()
-            v = row.get(key)
-            if v is not None:
-                return v
-            orig = col_map.get(key.lower().strip())
-            return row.get(orig, "") if orig else ""
-
-        def _f(key: str) -> float:
-            v = (_get(key) or "").replace(",", "").replace("%", "").strip()
+        def _f(v: str) -> float:
+            v = v.replace(",", "").replace("%", "").strip()
             try:
                 return float(v) if v else 0.0
             except ValueError:
@@ -2679,42 +2682,63 @@ def stock_screener_v2(
                 _name_to_sym[_n] = _sym
 
         results = []
+        tbody = table.find("tbody")
+        rows = tbody.find_all("tr") if tbody else table.find_all("tr")[1:]
 
-        for i, row in enumerate(reader):
+        for i, tr in enumerate(rows):
             if i >= limit:
                 break
             try:
-                _ensure_col_map()
+                cells = tr.find_all("td")
+                if not cells:
+                    continue
 
-                name   = (_get("Name") or "").strip()
-                price  = _f("Current Price")
-                mktcap = _f("Market Capitalization")
-                pe     = _f("Price to Earning")
-                roe    = _f("Return on equity")
-                roce   = _f("Return on capital employed")
-                margin = _f("Net profit margin")
-                de     = _f("Debt to equity")
-                rev_g  = _f("Sales growth 5Years")
-                pat_g  = _f("Profit growth 5Years")
-                div_y  = _f("Dividend Yield")
-                promo  = _f("Promoter Holding")
+                # Map header → cell text
+                cell_texts = [td.get_text(strip=True) for td in cells]
+                row_dict = dict(zip(headers, cell_texts)) if headers else {}
 
-                # Symbol resolution:
-                # 1. Try reverse lookup in STOCK_UNIVERSE by name
-                # 2. Fallback: clean the name string
-                sym_raw = _name_to_sym.get(name.lower().strip(), "")
-                if not sym_raw and name:
+                # Extract name and symbol from the first cell's <a> link
+                # Link format: /company/SYMBOL/ or /company/SYMBOL/consolidated/
+                name = ""
+                screener_slug = ""
+                first_a = cells[0].find("a") if cells else None
+                if first_a:
+                    name = first_a.get_text(strip=True)
+                    href = first_a.get("href", "")
+                    m = re.search(r"/company/([^/]+)/", href)
+                    if m:
+                        screener_slug = m.group(1).upper()
+                if not name:
+                    name = cell_texts[0] if cell_texts else ""
+
+                if not name:
+                    continue
+
+                # Symbol resolution: slug from URL > STOCK_UNIVERSE name lookup > slug itself
+                sym_raw = screener_slug
+                name_key = name.lower().strip()
+                if name_key in _name_to_sym:
+                    sym_raw = _name_to_sym[name_key]
+                elif not sym_raw:
                     clean = name.upper()
                     for sfx in [" LTD", " LIMITED", " LTD.", " INC", " CORP",
                                  " INDUSTRIES", " ENTERPRISES", " SOLUTIONS"]:
                         clean = clean.replace(sfx, "")
                     sym_raw = clean.strip().split()[0][:15] if clean.strip() else ""
 
-                # Skip truly empty rows (shouldn't happen but guard it)
-                if not name:
-                    continue
+                price  = _f(_col(row_dict, "CMP", "Current Price", "Price"))
+                mktcap = _f(_col(row_dict, "Market Cap", "Market Capitalization", "Mkt Cap"))
+                pe     = _f(_col(row_dict, "P/E", "Price to Earning", "PE"))
+                roe    = _f(_col(row_dict, "ROE", "Return on equity"))
+                roce   = _f(_col(row_dict, "ROCE", "Return on capital employed"))
+                margin = _f(_col(row_dict, "Net profit margin", "Net Margin", "OPM"))
+                de     = _f(_col(row_dict, "Debt to equity", "D/E", "Debt/Eq"))
+                rev_g  = _f(_col(row_dict, "Sales growth 5Years", "Sales Gr. 5Yr", "Rev Growth 5Y"))
+                pat_g  = _f(_col(row_dict, "Profit growth 5Years", "Profit Gr. 5Yr"))
+                div_y  = _f(_col(row_dict, "Dividend Yield", "Div Yield"))
+                promo  = _f(_col(row_dict, "Promoter Holding", "Promoter %"))
 
-                # Quality score for frontend sorting
+                # Quality score
                 score = 0
                 if roe >= 20:   score += 30
                 elif roe >= 15: score += 20
@@ -2727,24 +2751,27 @@ def stock_screener_v2(
                 elif margin >= 8: score += 15
 
                 results.append({
-                    "symbol":       sym_raw,
-                    "name":         name,
-                    "price":        price,
-                    "marketCap":    mktcap,
-                    "pe":           pe if pe > 0 else None,
-                    "roe":          roe,
-                    "roce":         roce,
-                    "netMargin":    margin,
-                    "debtToEquity": de,
+                    "symbol":         sym_raw,
+                    "name":           name,
+                    "screenerSlug":   screener_slug,
+                    "price":          price,
+                    "marketCap":      mktcap,
+                    "pe":             pe if pe > 0 else None,
+                    "roe":            roe,
+                    "roce":           roce,
+                    "netMargin":      margin,
+                    "debtToEquity":   de,
                     "revenueGrowth5Y": rev_g,
-                    "patGrowth5Y":  pat_g,
-                    "dividendYield": div_y,
+                    "patGrowth5Y":    pat_g,
+                    "dividendYield":  div_y,
                     "promoterHolding": promo,
-                    "score":        score,
+                    "score":          score,
                 })
-            except Exception:
+            except Exception as ex:
+                print(f"[ROBU] screener-v2 row {i} error: {ex}")
                 continue
 
+        print(f"[ROBU] screener-v2 returning {len(results)} results")
         return results
 
     except HTTPException:
