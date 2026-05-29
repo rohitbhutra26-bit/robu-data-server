@@ -2613,7 +2613,8 @@ def stock_screener_v2(
     sort_enc   = _up.quote(sort_param, safe="").replace("%20", "+")
     query_enc  = _up.quote(query,      safe="").replace("%20", "+")
 
-    url = f"https://www.screener.in/screen/raw/?sort={sort_enc}&query={query_enc}&fields={fields_encoded}"
+    # export=1 tells Screener to return CSV data instead of HTML page
+    url = f"https://www.screener.in/screen/raw/?sort={sort_enc}&query={query_enc}&fields={fields_encoded}&export=1"
     print(f"[ROBU] screener-v2 URL: {url[:300]}")
 
     try:
@@ -2621,8 +2622,7 @@ def stock_screener_v2(
         if not sess:
             raise HTTPException(503, "Screener.in session unavailable")
 
-        # Screener.in always returns HTML (ignores Accept header) — parse HTML table
-        hdrs = _make_browser_headers("https://www.screener.in/screens/")
+        hdrs = {**_make_browser_headers("https://www.screener.in/screens/"), "Accept": "text/csv,text/plain,*/*"}
         resp = sess.get(url, headers=hdrs, timeout=30)
 
         if resp.status_code == 429:
@@ -2630,9 +2630,81 @@ def stock_screener_v2(
         if not resp.ok:
             raise HTTPException(resp.status_code, f"Screener.in returned {resp.status_code}")
 
-        # ── Parse HTML table (Screener always returns HTML, never CSV) ──────────
-        html = resp.text
-        print(f"[ROBU] screener-v2 response length={len(html)}, starts={html.strip()[:80]}")
+        # ── Try CSV first (export=1), fall back to HTML table parsing ───────────
+        raw = resp.text
+        print(f"[ROBU] screener-v2 response length={len(raw)}, starts={raw.strip()[:120]}")
+
+        # If CSV response (starts with "Name," header row) — parse as CSV
+        if not raw.strip().startswith("<") and "," in (raw.split("\n")[0] if "\n" in raw else raw[:200]):
+            import csv, io
+            reader = csv.DictReader(io.StringIO(raw.strip()))
+            col_map = {(h or "").lower().strip(): h for h in (reader.fieldnames or [])}
+
+            def _get_csv(row, key):
+                v = row.get(key)
+                if v is not None: return v
+                orig = col_map.get(key.lower().strip())
+                return row.get(orig, "") if orig else ""
+
+            def _fc(row, *keys):
+                for k in keys:
+                    v = (_get_csv(row, k) or "").replace(",", "").replace("%", "").strip()
+                    if v:
+                        try: return float(v)
+                        except: pass
+                return 0.0
+
+            # Build name→symbol map
+            _name_to_sym2: dict[str, str] = {}
+            for _sym, _info in STOCK_UNIVERSE.items():
+                _n = (_info.get("name") or "").lower().strip()
+                if _n: _name_to_sym2[_n] = _sym
+
+            results = []
+            for i, row in enumerate(reader):
+                if i >= limit: break
+                name = (_get_csv(row, "Name") or "").strip()
+                if not name: continue
+                price  = _fc(row, "CMP", "Current Price", "Price")
+                mktcap = _fc(row, "Market Cap", "Market Capitalization")
+                pe     = _fc(row, "P/E", "Price to Earning")
+                roe    = _fc(row, "ROE", "Return on equity")
+                roce   = _fc(row, "ROCE", "Return on capital employed")
+                margin = _fc(row, "Net profit margin", "OPM", "Net Margin")
+                de     = _fc(row, "Debt to equity", "D/E")
+                rev_g  = _fc(row, "Sales growth 5Years", "Sales Gr. 5Yr")
+                pat_g  = _fc(row, "Profit growth 5Years", "Profit Gr. 5Yr")
+                div_y  = _fc(row, "Dividend Yield", "Div Yield")
+                promo  = _fc(row, "Promoter Holding", "Promoter %")
+
+                sym = _name_to_sym2.get(name.lower().strip(), "")
+                if not sym:
+                    clean = name.upper()
+                    for sfx in [" LTD", " LIMITED", " LTD.", " INC", " CORP", " INDUSTRIES"]:
+                        clean = clean.replace(sfx, "")
+                    sym = clean.strip().split()[0][:15] if clean.strip() else ""
+
+                score = 0
+                if roe >= 20: score += 30
+                elif roe >= 15: score += 20
+                elif roe >= 10: score += 10
+                if 0 < pe <= 20: score += 25
+                elif 0 < pe <= 35: score += 15
+                if de < 0.5: score += 20
+                elif de < 1: score += 10
+                if margin >= 15: score += 25
+                elif margin >= 8: score += 15
+
+                results.append({"symbol": sym, "name": name, "screenerSlug": sym,
+                    "price": price, "marketCap": mktcap, "pe": pe if pe > 0 else None,
+                    "roe": roe, "roce": roce, "netMargin": margin, "debtToEquity": de,
+                    "revenueGrowth5Y": rev_g, "patGrowth5Y": pat_g,
+                    "dividendYield": div_y, "promoterHolding": promo, "score": score})
+            print(f"[ROBU] screener-v2 CSV: {len(results)} results")
+            return results
+
+        # ── Fall back: parse HTML table ───────────────────────────────────────
+        html = raw
 
         if not _BS4_AVAILABLE:
             raise HTTPException(503, "beautifulsoup4 not installed on server")
