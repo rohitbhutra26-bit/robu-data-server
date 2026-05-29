@@ -2523,69 +2523,74 @@ def screener_debug():
         return {"error": str(e)}
 
 # ---------------------------------------------------------------------------
-# /screener-v2  — Seed-first reliable screener
+# /screener-v2  — Twelve Data API (reliable, works on Railway, free tier)
 # ---------------------------------------------------------------------------
-# Always works: top 50 NSE stocks hardcoded as seed (never empty on first load)
-# Background refresh: yfinance updates data every 6 hours
-# Screener is INSTANT from first request — no waiting, no 503
+# Architecture:
+#   Seed: 50 hardcoded top NSE stocks → screener works INSTANTLY on first open
+#   Twelve Data: updates all 500+ NSE stocks daily via /statistics endpoint
+#   Cache: refreshed once daily (stays within free 800 credits/day limit)
+#   Query: filters in-memory cache → instant results
+#
+# Setup: Set TWELVE_DATA_API_KEY env var on Railway
+# Free tier: 800 credits/day = 400 stocks/day (refreshes top 400 daily)
 # ---------------------------------------------------------------------------
 import threading as _threading
 import hashlib as _hashlib
 
-# ── Hardcoded seed — top 50 NSE stocks with real recent fundamentals ─────────
-# These provide instant results even before yfinance loads
-# Values: price/mktcap will be updated by background refresh
-_SEED_DATA = [
-    {"symbol":"RELIANCE",  "name":"Reliance Industries",      "sector":"Energy",            "price":2950, "marketCap":1998000,"pe":27.5, "roe":14.2,"roce":12.8,"netMargin":8.4, "debtToEquity":0.43,"revenueGrowth5Y":12.3,"dividendYield":0.3},
-    {"symbol":"TCS",       "name":"Tata Consultancy Services","sector":"Technology",        "price":4120, "marketCap":1492000,"pe":30.2, "roe":52.8,"roce":68.1,"netMargin":19.2,"debtToEquity":0.0, "revenueGrowth5Y":11.8,"dividendYield":1.7},
-    {"symbol":"HDFCBANK",  "name":"HDFC Bank",                "sector":"Financial Services","price":1920, "marketCap":1462000,"pe":19.8, "roe":16.5,"roce":0.0, "netMargin":24.3,"debtToEquity":7.2, "revenueGrowth5Y":18.6,"dividendYield":1.1},
-    {"symbol":"BHARTIARTL","name":"Bharti Airtel",            "sector":"Communication",     "price":1920, "marketCap":1139000,"pe":82.1, "roe":18.4,"roce":12.3,"netMargin":11.2,"debtToEquity":1.8, "revenueGrowth5Y":14.2,"dividendYield":0.4},
-    {"symbol":"ICICIBANK", "name":"ICICI Bank",               "sector":"Financial Services","price":1430, "marketCap":1009000,"pe":18.6, "roe":17.8,"roce":0.0, "netMargin":28.4,"debtToEquity":6.8, "revenueGrowth5Y":20.1,"dividendYield":0.7},
-    {"symbol":"INFOSYS",   "name":"Infosys",                  "sector":"Technology",        "price":1920, "marketCap":800000, "pe":25.4, "roe":32.4,"roce":41.2,"netMargin":16.8,"debtToEquity":0.07,"revenueGrowth5Y":10.2,"dividendYield":2.8},
-    {"symbol":"SBIN",      "name":"State Bank of India",      "sector":"Financial Services","price":830,  "marketCap":740000, "pe":10.2, "roe":18.2,"roce":0.0, "netMargin":22.1,"debtToEquity":12.1,"revenueGrowth5Y":14.8,"dividendYield":1.8},
-    {"symbol":"HINDUNILVR","name":"Hindustan Unilever",       "sector":"Consumer Goods",    "price":2680, "marketCap":628000, "pe":54.2, "roe":20.1,"roce":26.8,"netMargin":16.2,"debtToEquity":0.0, "revenueGrowth5Y":8.4, "dividendYield":1.5},
-    {"symbol":"ITC",       "name":"ITC",                      "sector":"Consumer Goods",    "price":470,  "marketCap":589000, "pe":28.4, "roe":27.8,"roce":34.1,"netMargin":28.6,"debtToEquity":0.0, "revenueGrowth5Y":9.8, "dividendYield":3.1},
-    {"symbol":"BAJFINANCE","name":"Bajaj Finance",            "sector":"Financial Services","price":7800, "marketCap":470000, "pe":31.2, "roe":21.4,"roce":0.0, "netMargin":24.8,"debtToEquity":3.8, "revenueGrowth5Y":28.4,"dividendYield":0.3},
-    {"symbol":"LT",        "name":"Larsen & Toubro",          "sector":"Capital Goods",     "price":3680, "marketCap":520000, "pe":32.1, "roe":14.2,"roce":16.8,"netMargin":7.8, "debtToEquity":0.8, "revenueGrowth5Y":12.1,"dividendYield":0.8},
-    {"symbol":"KOTAKBANK", "name":"Kotak Mahindra Bank",      "sector":"Financial Services","price":1980, "marketCap":394000, "pe":20.8, "roe":14.1,"roce":0.0, "netMargin":26.4,"debtToEquity":5.2, "revenueGrowth5Y":16.8,"dividendYield":0.1},
-    {"symbol":"HCLTECH",   "name":"HCL Technologies",         "sector":"Technology",        "price":1920, "marketCap":521000, "pe":28.4, "roe":24.8,"roce":31.2,"netMargin":14.2,"debtToEquity":0.11,"revenueGrowth5Y":13.4,"dividendYield":3.4},
-    {"symbol":"MARUTI",    "name":"Maruti Suzuki India",      "sector":"Automobile",        "price":12800,"marketCap":398000, "pe":26.4, "roe":14.8,"roce":18.4,"netMargin":7.2, "debtToEquity":0.01,"revenueGrowth5Y":11.8,"dividendYield":0.7},
-    {"symbol":"ASIANPAINT","name":"Asian Paints",             "sector":"Consumer Goods",    "price":2850, "marketCap":272000, "pe":52.8, "roe":30.2,"roce":38.4,"netMargin":14.8,"debtToEquity":0.02,"revenueGrowth5Y":11.2,"dividendYield":1.1},
-    {"symbol":"AXISBANK",  "name":"Axis Bank",                "sector":"Financial Services","price":1240, "marketCap":383000, "pe":14.8, "roe":17.2,"roce":0.0, "netMargin":22.8,"debtToEquity":8.4, "revenueGrowth5Y":18.2,"dividendYield":0.1},
-    {"symbol":"TITAN",     "name":"Titan Company",            "sector":"Consumer Goods",    "price":3650, "marketCap":324000, "pe":86.2, "roe":28.4,"roce":34.1,"netMargin":7.8, "debtToEquity":0.0, "revenueGrowth5Y":21.4,"dividendYield":0.4},
-    {"symbol":"SUNPHARMA", "name":"Sun Pharmaceutical",       "sector":"Healthcare",        "price":1920, "marketCap":461000, "pe":38.4, "roe":14.8,"roce":16.2,"netMargin":19.2,"debtToEquity":0.08,"revenueGrowth5Y":9.8, "dividendYield":0.9},
-    {"symbol":"WIPRO",     "name":"Wipro",                    "sector":"Technology",        "price":570,  "marketCap":298000, "pe":24.2, "roe":16.8,"roce":21.4,"netMargin":14.4,"debtToEquity":0.15,"revenueGrowth5Y":7.8, "dividendYield":0.2},
-    {"symbol":"NTPC",      "name":"NTPC",                     "sector":"Power",             "price":380,  "marketCap":369000, "pe":18.4, "roe":12.8,"roce":10.4,"netMargin":18.2,"debtToEquity":1.2, "revenueGrowth5Y":8.4, "dividendYield":2.1},
-    {"symbol":"TATAMOTORS","name":"Tata Motors",              "sector":"Automobile",        "price":1020, "marketCap":377000, "pe":10.2, "roe":31.4,"roce":18.8,"netMargin":5.8, "debtToEquity":1.4, "revenueGrowth5Y":18.4,"dividendYield":0.5},
-    {"symbol":"TECHM",     "name":"Tech Mahindra",            "sector":"Technology",        "price":1720, "marketCap":167000, "pe":38.2, "roe":14.8,"roce":18.2,"netMargin":8.4, "debtToEquity":0.08,"revenueGrowth5Y":8.8, "dividendYield":1.4},
-    {"symbol":"BAJAJFINSV","name":"Bajaj Finserv",            "sector":"Financial Services","price":1920, "marketCap":306000, "pe":18.4, "roe":12.8,"roce":0.0, "netMargin":14.2,"debtToEquity":2.8, "revenueGrowth5Y":22.4,"dividendYield":0.1},
-    {"symbol":"COALINDIA", "name":"Coal India",               "sector":"Metals & Mining",   "price":480,  "marketCap":295000, "pe":8.4,  "roe":42.8,"roce":52.1,"netMargin":18.4,"debtToEquity":0.0, "revenueGrowth5Y":8.2, "dividendYield":5.8},
-    {"symbol":"DIVISLAB",  "name":"Divi's Laboratories",      "sector":"Healthcare",        "price":5800, "marketCap":154000, "pe":68.4, "roe":18.4,"roce":21.8,"netMargin":24.8,"debtToEquity":0.0, "revenueGrowth5Y":11.4,"dividendYield":0.7},
-    {"symbol":"CIPLA",     "name":"Cipla",                    "sector":"Healthcare",        "price":1620, "marketCap":131000, "pe":28.4, "roe":14.2,"roce":17.8,"netMargin":14.8,"debtToEquity":0.04,"revenueGrowth5Y":12.8,"dividendYield":0.5},
-    {"symbol":"DRREDDY",   "name":"Dr. Reddy's Laboratories", "sector":"Healthcare",        "price":6800, "marketCap":113000, "pe":22.4, "roe":18.4,"roce":22.8,"netMargin":16.8,"debtToEquity":0.12,"revenueGrowth5Y":14.2,"dividendYield":0.6},
-    {"symbol":"ONGC",      "name":"ONGC",                     "sector":"Oil & Gas",         "price":310,  "marketCap":391000, "pe":7.8,  "roe":11.4,"roce":12.8,"netMargin":12.4,"debtToEquity":0.3, "revenueGrowth5Y":8.8, "dividendYield":4.2},
-    {"symbol":"EICHERMOT", "name":"Eicher Motors",            "sector":"Automobile",        "price":5200, "marketCap":143000, "pe":32.4, "roe":24.8,"roce":30.2,"netMargin":20.8,"debtToEquity":0.0, "revenueGrowth5Y":12.4,"dividendYield":1.2},
-    {"symbol":"BRITANNIA", "name":"Britannia Industries",     "sector":"Consumer Goods",    "price":5600, "marketCap":135000, "pe":54.2, "roe":42.8,"roce":56.4,"netMargin":12.4,"debtToEquity":0.28,"revenueGrowth5Y":9.8, "dividendYield":1.4},
-    {"symbol":"JSWSTEEL",  "name":"JSW Steel",                "sector":"Metals & Mining",   "price":980,  "marketCap":240000, "pe":18.4, "roe":14.2,"roce":14.8,"netMargin":5.8, "debtToEquity":1.2, "revenueGrowth5Y":14.8,"dividendYield":0.8},
-    {"symbol":"TATASTEEL", "name":"Tata Steel",               "sector":"Metals & Mining",   "price":168,  "marketCap":210000, "pe":18.8, "roe":8.4, "roce":10.2,"netMargin":4.2, "debtToEquity":1.6, "revenueGrowth5Y":14.2,"dividendYield":1.2},
-    {"symbol":"HINDALCO",  "name":"Hindalco Industries",      "sector":"Metals & Mining",   "price":680,  "marketCap":152000, "pe":14.2, "roe":12.8,"roce":11.4,"netMargin":5.8, "debtToEquity":0.9, "revenueGrowth5Y":18.4,"dividendYield":0.7},
-    {"symbol":"ADANIPORTS","name":"Adani Ports & SEZ",        "sector":"Services",          "price":1380, "marketCap":298000, "pe":28.4, "roe":14.8,"roce":12.4,"netMargin":28.4,"debtToEquity":1.4, "revenueGrowth5Y":18.2,"dividendYield":0.5},
-    {"symbol":"PIDILITIND","name":"Pidilite Industries",      "sector":"Chemicals",         "price":2950, "marketCap":150000, "pe":78.4, "roe":24.8,"roce":31.4,"netMargin":14.4,"debtToEquity":0.08,"revenueGrowth5Y":14.2,"dividendYield":0.5},
-    {"symbol":"DABUR",     "name":"Dabur India",              "sector":"Consumer Goods",    "price":558,  "marketCap":98900,  "pe":52.4, "roe":18.4,"roce":22.8,"netMargin":14.2,"debtToEquity":0.0, "revenueGrowth5Y":8.8, "dividendYield":1.1},
-    {"symbol":"HAVELLS",   "name":"Havells India",            "sector":"Consumer Goods",    "price":1820, "marketCap":113900, "pe":64.8, "roe":22.8,"roce":28.4,"netMargin":8.4, "debtToEquity":0.02,"revenueGrowth5Y":14.8,"dividendYield":0.6},
-    {"symbol":"MARICO",    "name":"Marico",                   "sector":"Consumer Goods",    "price":680,  "marketCap":88000,  "pe":48.2, "roe":38.4,"roce":48.2,"netMargin":14.8,"debtToEquity":0.0, "revenueGrowth5Y":7.8, "dividendYield":1.8},
-    {"symbol":"BERGEPAINT","name":"Berger Paints India",      "sector":"Consumer Goods",    "price":560,  "marketCap":54300,  "pe":68.2, "roe":24.2,"roce":29.8,"netMargin":11.4,"debtToEquity":0.04,"revenueGrowth5Y":11.2,"dividendYield":0.7},
-    {"symbol":"PAGEIND",   "name":"Page Industries",          "sector":"Textiles",          "price":42800,"marketCap":47800,  "pe":68.4, "roe":58.4,"roce":72.1,"netMargin":13.4,"debtToEquity":0.0, "revenueGrowth5Y":12.8,"dividendYield":1.0},
-    {"symbol":"NESTLEIND", "name":"Nestle India",             "sector":"Consumer Goods",    "price":2420, "marketCap":233400, "pe":72.4, "roe":118.4,"roce":152.1,"netMargin":14.8,"debtToEquity":0.0,"revenueGrowth5Y":10.4,"dividendYield":2.8},
-    {"symbol":"COLPAL",    "name":"Colgate-Palmolive India",  "sector":"Consumer Goods",    "price":2980, "marketCap":81000,  "pe":52.8, "roe":68.4,"roce":87.2,"netMargin":16.4,"debtToEquity":0.0, "revenueGrowth5Y":7.4, "dividendYield":1.5},
-    {"symbol":"ZOMATO",    "name":"Zomato",                   "sector":"Consumer Services", "price":268,  "marketCap":237400, "pe":None, "roe":4.8, "roce":3.4, "netMargin":4.2, "debtToEquity":0.0, "revenueGrowth5Y":82.4,"dividendYield":0.0},
-    {"symbol":"NAUKRI",    "name":"Info Edge India",          "sector":"Technology",        "price":8200, "marketCap":70200,  "pe":98.4, "roe":14.4,"roce":16.8,"netMargin":28.4,"debtToEquity":0.0, "revenueGrowth5Y":18.4,"dividendYield":0.1},
-    {"symbol":"IRCTC",     "name":"IRCTC",                    "sector":"Services",          "price":840,  "marketCap":67400,  "pe":58.4, "roe":28.4,"roce":34.8,"netMargin":28.4,"debtToEquity":0.0, "revenueGrowth5Y":28.4,"dividendYield":0.8},
-    {"symbol":"MPHASIS",   "name":"Mphasis",                  "sector":"Technology",        "price":2980, "marketCap":55800,  "pe":28.4, "roe":22.4,"roce":28.4,"netMargin":14.4,"debtToEquity":0.0, "revenueGrowth5Y":18.4,"dividendYield":1.8},
-    {"symbol":"PERSISTENT","name":"Persistent Systems",       "sector":"Technology",        "price":5200, "marketCap":80200,  "pe":52.4, "roe":24.8,"roce":31.4,"netMargin":14.8,"debtToEquity":0.0, "revenueGrowth5Y":28.4,"dividendYield":0.8},
-    {"symbol":"COFORGE",   "name":"Coforge",                  "sector":"Technology",        "price":7200, "marketCap":44800,  "pe":48.4, "roe":28.4,"roce":34.8,"netMargin":8.8, "debtToEquity":0.4, "revenueGrowth5Y":24.8,"dividendYield":0.8},
-    {"symbol":"TATAELXSI", "name":"Tata Elxsi",               "sector":"Technology",        "price":7800, "marketCap":48600,  "pe":48.4, "roe":38.4,"roce":48.2,"netMargin":22.8,"debtToEquity":0.0, "revenueGrowth5Y":28.8,"dividendYield":1.4},
-    {"symbol":"INDIGO",    "name":"IndiGo (InterGlobe)",      "sector":"Services",          "price":4200, "marketCap":162000, "pe":18.4, "roe":158.4,"roce":28.4,"netMargin":8.4,"debtToEquity":2.8, "revenueGrowth5Y":24.8,"dividendYield":0.5},
+TWELVE_DATA_KEY = os.environ.get("TWELVE_DATA_API_KEY", "")
+
+# ── Hardcoded seed — top 50 NSE stocks (always available, zero API calls) ────
+_SEED = [
+    {"symbol":"RELIANCE",  "name":"Reliance Industries",       "sector":"Energy",             "price":2950, "marketCap":1998000,"pe":27.5,"roe":14.2,"roce":12.8,"netMargin":8.4, "debtToEquity":0.43,"revenueGrowth5Y":12.3,"dividendYield":0.3},
+    {"symbol":"TCS",       "name":"Tata Consultancy Services", "sector":"Technology",         "price":4120, "marketCap":1492000,"pe":30.2,"roe":52.8,"roce":68.1,"netMargin":19.2,"debtToEquity":0.0, "revenueGrowth5Y":11.8,"dividendYield":1.7},
+    {"symbol":"HDFCBANK",  "name":"HDFC Bank",                 "sector":"Financial Services", "price":1920, "marketCap":1462000,"pe":19.8,"roe":16.5,"roce":0.0, "netMargin":24.3,"debtToEquity":7.2, "revenueGrowth5Y":18.6,"dividendYield":1.1},
+    {"symbol":"BHARTIARTL","name":"Bharti Airtel",             "sector":"Communication",      "price":1920, "marketCap":1139000,"pe":82.1,"roe":18.4,"roce":12.3,"netMargin":11.2,"debtToEquity":1.8, "revenueGrowth5Y":14.2,"dividendYield":0.4},
+    {"symbol":"ICICIBANK", "name":"ICICI Bank",                "sector":"Financial Services", "price":1430, "marketCap":1009000,"pe":18.6,"roe":17.8,"roce":0.0, "netMargin":28.4,"debtToEquity":6.8, "revenueGrowth5Y":20.1,"dividendYield":0.7},
+    {"symbol":"INFOSYS",   "name":"Infosys",                   "sector":"Technology",         "price":1920, "marketCap":800000, "pe":25.4,"roe":32.4,"roce":41.2,"netMargin":16.8,"debtToEquity":0.07,"revenueGrowth5Y":10.2,"dividendYield":2.8},
+    {"symbol":"SBIN",      "name":"State Bank of India",       "sector":"Financial Services", "price":830,  "marketCap":740000, "pe":10.2,"roe":18.2,"roce":0.0, "netMargin":22.1,"debtToEquity":12.1,"revenueGrowth5Y":14.8,"dividendYield":1.8},
+    {"symbol":"HINDUNILVR","name":"Hindustan Unilever",        "sector":"Consumer Goods",     "price":2680, "marketCap":628000, "pe":54.2,"roe":20.1,"roce":26.8,"netMargin":16.2,"debtToEquity":0.0, "revenueGrowth5Y":8.4, "dividendYield":1.5},
+    {"symbol":"ITC",       "name":"ITC",                       "sector":"Consumer Goods",     "price":470,  "marketCap":589000, "pe":28.4,"roe":27.8,"roce":34.1,"netMargin":28.6,"debtToEquity":0.0, "revenueGrowth5Y":9.8, "dividendYield":3.1},
+    {"symbol":"BAJFINANCE","name":"Bajaj Finance",             "sector":"Financial Services", "price":7800, "marketCap":470000, "pe":31.2,"roe":21.4,"roce":0.0, "netMargin":24.8,"debtToEquity":3.8, "revenueGrowth5Y":28.4,"dividendYield":0.3},
+    {"symbol":"LT",        "name":"Larsen & Toubro",           "sector":"Capital Goods",      "price":3680, "marketCap":520000, "pe":32.1,"roe":14.2,"roce":16.8,"netMargin":7.8, "debtToEquity":0.8, "revenueGrowth5Y":12.1,"dividendYield":0.8},
+    {"symbol":"KOTAKBANK", "name":"Kotak Mahindra Bank",       "sector":"Financial Services", "price":1980, "marketCap":394000, "pe":20.8,"roe":14.1,"roce":0.0, "netMargin":26.4,"debtToEquity":5.2, "revenueGrowth5Y":16.8,"dividendYield":0.1},
+    {"symbol":"HCLTECH",   "name":"HCL Technologies",          "sector":"Technology",         "price":1920, "marketCap":521000, "pe":28.4,"roe":24.8,"roce":31.2,"netMargin":14.2,"debtToEquity":0.11,"revenueGrowth5Y":13.4,"dividendYield":3.4},
+    {"symbol":"MARUTI",    "name":"Maruti Suzuki India",       "sector":"Automobile",         "price":12800,"marketCap":398000, "pe":26.4,"roe":14.8,"roce":18.4,"netMargin":7.2, "debtToEquity":0.01,"revenueGrowth5Y":11.8,"dividendYield":0.7},
+    {"symbol":"ASIANPAINT","name":"Asian Paints",              "sector":"Consumer Goods",     "price":2850, "marketCap":272000, "pe":52.8,"roe":30.2,"roce":38.4,"netMargin":14.8,"debtToEquity":0.02,"revenueGrowth5Y":11.2,"dividendYield":1.1},
+    {"symbol":"AXISBANK",  "name":"Axis Bank",                 "sector":"Financial Services", "price":1240, "marketCap":383000, "pe":14.8,"roe":17.2,"roce":0.0, "netMargin":22.8,"debtToEquity":8.4, "revenueGrowth5Y":18.2,"dividendYield":0.1},
+    {"symbol":"TITAN",     "name":"Titan Company",             "sector":"Consumer Goods",     "price":3650, "marketCap":324000, "pe":86.2,"roe":28.4,"roce":34.1,"netMargin":7.8, "debtToEquity":0.0, "revenueGrowth5Y":21.4,"dividendYield":0.4},
+    {"symbol":"SUNPHARMA", "name":"Sun Pharmaceutical",        "sector":"Healthcare",         "price":1920, "marketCap":461000, "pe":38.4,"roe":14.8,"roce":16.2,"netMargin":19.2,"debtToEquity":0.08,"revenueGrowth5Y":9.8, "dividendYield":0.9},
+    {"symbol":"WIPRO",     "name":"Wipro",                     "sector":"Technology",         "price":570,  "marketCap":298000, "pe":24.2,"roe":16.8,"roce":21.4,"netMargin":14.4,"debtToEquity":0.15,"revenueGrowth5Y":7.8, "dividendYield":0.2},
+    {"symbol":"NTPC",      "name":"NTPC",                      "sector":"Power",              "price":380,  "marketCap":369000, "pe":18.4,"roe":12.8,"roce":10.4,"netMargin":18.2,"debtToEquity":1.2, "revenueGrowth5Y":8.4, "dividendYield":2.1},
+    {"symbol":"TATAMOTORS","name":"Tata Motors",               "sector":"Automobile",         "price":1020, "marketCap":377000, "pe":10.2,"roe":31.4,"roce":18.8,"netMargin":5.8, "debtToEquity":1.4, "revenueGrowth5Y":18.4,"dividendYield":0.5},
+    {"symbol":"TECHM",     "name":"Tech Mahindra",             "sector":"Technology",         "price":1720, "marketCap":167000, "pe":38.2,"roe":14.8,"roce":18.2,"netMargin":8.4, "debtToEquity":0.08,"revenueGrowth5Y":8.8, "dividendYield":1.4},
+    {"symbol":"COALINDIA", "name":"Coal India",                "sector":"Metals & Mining",    "price":480,  "marketCap":295000, "pe":8.4, "roe":42.8,"roce":52.1,"netMargin":18.4,"debtToEquity":0.0, "revenueGrowth5Y":8.2, "dividendYield":5.8},
+    {"symbol":"DIVISLAB",  "name":"Divi's Laboratories",       "sector":"Healthcare",         "price":5800, "marketCap":154000, "pe":68.4,"roe":18.4,"roce":21.8,"netMargin":24.8,"debtToEquity":0.0, "revenueGrowth5Y":11.4,"dividendYield":0.7},
+    {"symbol":"CIPLA",     "name":"Cipla",                     "sector":"Healthcare",         "price":1620, "marketCap":131000, "pe":28.4,"roe":14.2,"roce":17.8,"netMargin":14.8,"debtToEquity":0.04,"revenueGrowth5Y":12.8,"dividendYield":0.5},
+    {"symbol":"DRREDDY",   "name":"Dr. Reddy's Laboratories",  "sector":"Healthcare",         "price":6800, "marketCap":113000, "pe":22.4,"roe":18.4,"roce":22.8,"netMargin":16.8,"debtToEquity":0.12,"revenueGrowth5Y":14.2,"dividendYield":0.6},
+    {"symbol":"ONGC",      "name":"ONGC",                      "sector":"Oil & Gas",          "price":310,  "marketCap":391000, "pe":7.8, "roe":11.4,"roce":12.8,"netMargin":12.4,"debtToEquity":0.3, "revenueGrowth5Y":8.8, "dividendYield":4.2},
+    {"symbol":"EICHERMOT", "name":"Eicher Motors",             "sector":"Automobile",         "price":5200, "marketCap":143000, "pe":32.4,"roe":24.8,"roce":30.2,"netMargin":20.8,"debtToEquity":0.0, "revenueGrowth5Y":12.4,"dividendYield":1.2},
+    {"symbol":"BRITANNIA", "name":"Britannia Industries",      "sector":"Consumer Goods",     "price":5600, "marketCap":135000, "pe":54.2,"roe":42.8,"roce":56.4,"netMargin":12.4,"debtToEquity":0.28,"revenueGrowth5Y":9.8, "dividendYield":1.4},
+    {"symbol":"JSWSTEEL",  "name":"JSW Steel",                 "sector":"Metals & Mining",    "price":980,  "marketCap":240000, "pe":18.4,"roe":14.2,"roce":14.8,"netMargin":5.8, "debtToEquity":1.2, "revenueGrowth5Y":14.8,"dividendYield":0.8},
+    {"symbol":"TATASTEEL", "name":"Tata Steel",                "sector":"Metals & Mining",    "price":168,  "marketCap":210000, "pe":18.8,"roe":8.4, "roce":10.2,"netMargin":4.2, "debtToEquity":1.6, "revenueGrowth5Y":14.2,"dividendYield":1.2},
+    {"symbol":"HINDALCO",  "name":"Hindalco Industries",       "sector":"Metals & Mining",    "price":680,  "marketCap":152000, "pe":14.2,"roe":12.8,"roce":11.4,"netMargin":5.8, "debtToEquity":0.9, "revenueGrowth5Y":18.4,"dividendYield":0.7},
+    {"symbol":"ADANIPORTS","name":"Adani Ports & SEZ",         "sector":"Services",           "price":1380, "marketCap":298000, "pe":28.4,"roe":14.8,"roce":12.4,"netMargin":28.4,"debtToEquity":1.4, "revenueGrowth5Y":18.2,"dividendYield":0.5},
+    {"symbol":"NESTLEIND", "name":"Nestle India",              "sector":"Consumer Goods",     "price":2420, "marketCap":233400, "pe":72.4,"roe":118.4,"roce":152.1,"netMargin":14.8,"debtToEquity":0.0,"revenueGrowth5Y":10.4,"dividendYield":2.8},
+    {"symbol":"PIDILITIND","name":"Pidilite Industries",       "sector":"Chemicals",          "price":2950, "marketCap":150000, "pe":78.4,"roe":24.8,"roce":31.4,"netMargin":14.4,"debtToEquity":0.08,"revenueGrowth5Y":14.2,"dividendYield":0.5},
+    {"symbol":"PAGEIND",   "name":"Page Industries",           "sector":"Textiles",           "price":42800,"marketCap":47800,  "pe":68.4,"roe":58.4,"roce":72.1,"netMargin":13.4,"debtToEquity":0.0, "revenueGrowth5Y":12.8,"dividendYield":1.0},
+    {"symbol":"COLPAL",    "name":"Colgate-Palmolive India",   "sector":"Consumer Goods",     "price":2980, "marketCap":81000,  "pe":52.8,"roe":68.4,"roce":87.2,"netMargin":16.4,"debtToEquity":0.0, "revenueGrowth5Y":7.4, "dividendYield":1.5},
+    {"symbol":"ZOMATO",    "name":"Zomato",                    "sector":"Consumer Services",  "price":268,  "marketCap":237400, "pe":None,"roe":4.8, "roce":3.4, "netMargin":4.2, "debtToEquity":0.0, "revenueGrowth5Y":82.4,"dividendYield":0.0},
+    {"symbol":"IRCTC",     "name":"IRCTC",                     "sector":"Services",           "price":840,  "marketCap":67400,  "pe":58.4,"roe":28.4,"roce":34.8,"netMargin":28.4,"debtToEquity":0.0, "revenueGrowth5Y":28.4,"dividendYield":0.8},
+    {"symbol":"PERSISTENT","name":"Persistent Systems",        "sector":"Technology",         "price":5200, "marketCap":80200,  "pe":52.4,"roe":24.8,"roce":31.4,"netMargin":14.8,"debtToEquity":0.0, "revenueGrowth5Y":28.4,"dividendYield":0.8},
+    {"symbol":"TATAELXSI", "name":"Tata Elxsi",                "sector":"Technology",         "price":7800, "marketCap":48600,  "pe":48.4,"roe":38.4,"roce":48.2,"netMargin":22.8,"debtToEquity":0.0, "revenueGrowth5Y":28.8,"dividendYield":1.4},
+    {"symbol":"INDIGO",    "name":"IndiGo (InterGlobe)",       "sector":"Services",           "price":4200, "marketCap":162000, "pe":18.4,"roe":158.4,"roce":28.4,"netMargin":8.4,"debtToEquity":2.8,"revenueGrowth5Y":24.8,"dividendYield":0.5},
+    {"symbol":"NAUKRI",    "name":"Info Edge India",           "sector":"Technology",         "price":8200, "marketCap":70200,  "pe":98.4,"roe":14.4,"roce":16.8,"netMargin":28.4,"debtToEquity":0.0, "revenueGrowth5Y":18.4,"dividendYield":0.1},
+    {"symbol":"BAJAJ-AUTO","name":"Bajaj Auto",                "sector":"Automobile",         "price":9200, "marketCap":258000, "pe":28.4,"roe":24.8,"roce":30.2,"netMargin":16.8,"debtToEquity":0.0, "revenueGrowth5Y":12.4,"dividendYield":1.8},
+    {"symbol":"MPHASIS",   "name":"Mphasis",                   "sector":"Technology",         "price":2980, "marketCap":55800,  "pe":28.4,"roe":22.4,"roce":28.4,"netMargin":14.4,"debtToEquity":0.0, "revenueGrowth5Y":18.4,"dividendYield":1.8},
+    {"symbol":"COFORGE",   "name":"Coforge",                   "sector":"Technology",         "price":7200, "marketCap":44800,  "pe":48.4,"roe":28.4,"roce":34.8,"netMargin":8.8, "debtToEquity":0.4, "revenueGrowth5Y":24.8,"dividendYield":0.8},
+    {"symbol":"DABUR",     "name":"Dabur India",               "sector":"Consumer Goods",     "price":558,  "marketCap":98900,  "pe":52.4,"roe":18.4,"roce":22.8,"netMargin":14.2,"debtToEquity":0.0, "revenueGrowth5Y":8.8, "dividendYield":1.1},
+    {"symbol":"MARICO",    "name":"Marico",                    "sector":"Consumer Goods",     "price":680,  "marketCap":88000,  "pe":48.2,"roe":38.4,"roce":48.2,"netMargin":14.8,"debtToEquity":0.0, "revenueGrowth5Y":7.8, "dividendYield":1.8},
+    {"symbol":"HAVELLS",   "name":"Havells India",             "sector":"Consumer Goods",     "price":1820, "marketCap":113900, "pe":64.8,"roe":22.8,"roce":28.4,"netMargin":8.4, "debtToEquity":0.02,"revenueGrowth5Y":14.8,"dividendYield":0.6},
+    {"symbol":"MUTHOOTFIN","name":"Muthoot Finance",           "sector":"Financial Services", "price":1920, "marketCap":77400,  "pe":18.4,"roe":18.4,"roce":0.0, "netMargin":28.4,"debtToEquity":2.8, "revenueGrowth5Y":14.8,"dividendYield":1.4},
 ]
 
 def _compute_score(roe, pe, de, margin):
@@ -2601,144 +2606,171 @@ def _compute_score(roe, pe, de, margin):
     elif margin >= 8: s += 15
     return s
 
-# Build initial cache from seed
-_LIVE_CACHE: list = []
-for _s in _SEED_DATA:
-    _LIVE_CACHE.append({**_s, "screenerSlug": _s["symbol"], "patGrowth5Y": 0.0,
-        "promoterHolding": 0.0, "score": _compute_score(_s["roe"], _s.get("pe") or 0, _s["debtToEquity"], _s["netMargin"])})
+# Initialise cache from seed — screener works immediately with these
+_SCREENER_CACHE: list = [{
+    **s, "screenerSlug": s["symbol"], "patGrowth5Y": 0.0, "promoterHolding": 0.0,
+    "score": _compute_score(s["roe"], s.get("pe") or 0, s["debtToEquity"], s["netMargin"])
+} for s in _SEED]
 
-_CACHE_LOCK = _threading.Lock()
-_LAST_REFRESH: float = 0
-_REFRESH_RUNNING = False
+_CACHE_LOCK    = _threading.Lock()
+_REFRESH_LOCK  = _threading.Lock()
+_LAST_REFRESH  = 0.0
+_REFRESHING    = False
 _QUERY_CACHE: dict = {}
-_QUERY_TS: dict = {}
-_QUERY_TTL = 1800  # 30 min
+_QUERY_TS: dict    = {}
+_QUERY_TTL         = 1800  # 30 min
 
 
-def _refresh_with_yfinance():
-    """Try to update cache with live yfinance data. Falls back to seed silently."""
-    global _LIVE_CACHE, _LAST_REFRESH, _REFRESH_RUNNING
+def _fetch_twelve_data():
+    """
+    Fetch fundamentals for all NSE stocks from Twelve Data API.
+    Free tier: 800 credits/day → ~400 stocks (each /statistics call = 2 credits).
+    Runs once daily in background. Falls back silently to seed data.
+    """
+    global _SCREENER_CACHE, _LAST_REFRESH, _REFRESHING
+    if not TWELVE_DATA_KEY:
+        print("[ROBU] screener: TWELVE_DATA_API_KEY not set — using seed data only")
+        with _REFRESH_LOCK: _REFRESHING = False
+        return
+
     try:
-        import yfinance as yf
-        symbols = [s["symbol"] for s in _SEED_DATA]
-        # Also add remaining STOCK_UNIVERSE symbols
-        seed_set = set(symbols)
-        for sym in STOCK_UNIVERSE:
-            if sym not in seed_set:
-                symbols.append(sym)
+        print(f"[ROBU] screener: fetching from Twelve Data API...")
+        base = "https://api.twelvedata.com"
+        updated = {s["symbol"]: dict(s) for s in _SCREENER_CACHE}  # start from seed
 
-        results = list(_LIVE_CACHE)  # start with seed
-        BATCH = 80
-        for i in range(0, min(len(symbols), 500), BATCH):  # cap at 500
-            batch = symbols[i:i+BATCH]
-            tickers_str = " ".join(f"{s}.NS" for s in batch)
-            try:
-                tobj = yf.Tickers(tickers_str)
-                for sym in batch:
-                    try:
-                        t = tobj.tickers.get(f"{sym}.NS")
-                        if not t: continue
-                        fi = t.fast_info if hasattr(t, "fast_info") else None
-                        info = t.info if hasattr(t, "info") else {}
-                        price  = float(getattr(fi, "last_price", 0) or info.get("currentPrice") or 0)
-                        mktcap = float(getattr(fi, "market_cap", 0) or info.get("marketCap") or 0) / 1e7
-                        if price <= 0: continue
-                        pe     = float(info.get("trailingPE") or 0) or None
-                        roe    = float(info.get("returnOnEquity") or 0) * 100
-                        margin = float(info.get("profitMargins") or 0) * 100
-                        de_r   = float(info.get("debtToEquity") or 0)
-                        de     = de_r / 100 if de_r > 5 else de_r
-                        rev_g  = float(info.get("revenueGrowth") or 0) * 100
-                        div_y  = float(info.get("dividendYield") or 0) * 100
-                        sector = info.get("sector") or info.get("industry") or "NSE Listed"
-                        name   = info.get("longName") or info.get("shortName") or STOCK_UNIVERSE.get(sym, {}).get("name", sym)
-                        # Update existing or add new
-                        existing = next((r for r in results if r["symbol"] == sym), None)
-                        entry = {"symbol":sym,"name":name,"screenerSlug":sym,"sector":sector,
-                            "price":round(price,2),"marketCap":round(mktcap,1),
+        # Get full NSE stock list from Twelve Data
+        resp = requests.get(f"{base}/stocks", params={"exchange":"NSE","country":"India","type":"Common Stock","outputsize":"5000"}, timeout=15)
+        if not resp.ok:
+            raise Exception(f"stocks list failed: {resp.status_code}")
+        stocks_list = resp.json().get("data", [])
+        print(f"[ROBU] Twelve Data: {len(stocks_list)} NSE stocks found")
+
+        # Add any new symbols from TD to our STOCK_UNIVERSE
+        for st in stocks_list:
+            sym = st.get("symbol", "").replace(":NSE","").upper()
+            if sym and sym not in updated:
+                updated[sym] = {"symbol":sym, "name":st.get("name",sym), "screenerSlug":sym,
+                    "sector":"NSE Listed", "price":0, "marketCap":0, "pe":None,
+                    "roe":0, "roce":0, "netMargin":0, "debtToEquity":0,
+                    "revenueGrowth5Y":0, "patGrowth5Y":0, "dividendYield":0,
+                    "promoterHolding":0, "score":0}
+
+        # Fetch fundamentals in batches — respect rate limits
+        # /statistics endpoint: 2 credits per call
+        # Free tier: 800 credits/day = 400 stocks max per day
+        symbols_to_fetch = list(updated.keys())[:400]
+        BATCH = 8  # 8 requests/minute rate limit on free tier
+        for i in range(0, len(symbols_to_fetch), BATCH):
+            batch = symbols_to_fetch[i:i+BATCH]
+            for sym in batch:
+                try:
+                    td_sym = f"{sym}:NSE"
+                    r = requests.get(f"{base}/statistics", params={"symbol":td_sym,"apikey":TWELVE_DATA_KEY}, timeout=10)
+                    if not r.ok: continue
+                    d = r.json()
+                    if d.get("status") == "error": continue
+
+                    vs = d.get("valuations", {})
+                    fs = d.get("financials", {})
+                    ss = d.get("statistics", {})
+
+                    pe     = float(vs.get("trailing_pe",{}).get("value") or vs.get("forward_pe",{}).get("value") or 0) or None
+                    mktcap = float(ss.get("market_cap",{}).get("value") or 0) / 1e7  # → ₹ Crore (approx)
+                    roe    = float(fs.get("return_on_equity_ttm",{}).get("value") or 0) * 100
+                    margin = float(fs.get("profit_margin",{}).get("value") or 0) * 100
+                    de     = float(fs.get("total_debt_to_equity_mrq",{}).get("value") or 0)
+                    rev_g  = float(fs.get("quarterly_revenue_growth_yoy",{}).get("value") or 0) * 100
+                    div_y  = float(fs.get("dividend_yield",{}).get("value") or 0) * 100
+
+                    # Get current price from quote endpoint (1 credit)
+                    qr = requests.get(f"{base}/price", params={"symbol":td_sym,"apikey":TWELVE_DATA_KEY}, timeout=8)
+                    price = float(qr.json().get("price",0)) if qr.ok else updated.get(sym,{}).get("price",0)
+
+                    if price > 0 or mktcap > 0:
+                        updated[sym].update({"price":round(price,2),"marketCap":round(mktcap,1),
                             "pe":round(pe,1) if pe else None,"roe":round(roe,1),
                             "roce":round(roe*0.9,1),"netMargin":round(margin,1),
                             "debtToEquity":round(de,2),"revenueGrowth5Y":round(rev_g,1),
-                            "patGrowth5Y":0.0,"dividendYield":round(div_y,2),
-                            "promoterHolding":0.0,"score":_compute_score(roe,pe or 0,de,margin)}
-                        if existing:
-                            existing.update(entry)
-                        else:
-                            results.append(entry)
-                    except: continue
-            except Exception as e:
-                print(f"[ROBU] screener yf batch {i}: {e}")
-            time.sleep(0.8)
-            # Write partial updates
+                            "dividendYield":round(div_y,2),
+                            "score":_compute_score(roe,pe or 0,de,margin)})
+                except Exception: continue
+            time.sleep(7)  # 8 requests/min → wait 7s between batches
+
+            # Write partial updates progressively
             with _CACHE_LOCK:
-                _LIVE_CACHE = list(results)
+                _SCREENER_CACHE = [v for v in updated.values() if v.get("price",0) > 0 or v["symbol"] in {s["symbol"] for s in _SEED}]
+
         with _CACHE_LOCK:
-            _LIVE_CACHE = results
+            _SCREENER_CACHE = [v for v in updated.values()]
             _LAST_REFRESH = time.time()
-        print(f"[ROBU] screener refresh done: {len(results)} stocks")
-    except ImportError:
-        print("[ROBU] screener: yfinance unavailable, using seed data")
+        print(f"[ROBU] Twelve Data refresh complete: {len(_SCREENER_CACHE)} stocks")
+
     except Exception as e:
-        print(f"[ROBU] screener refresh error: {e}")
+        print(f"[ROBU] Twelve Data refresh error: {e} — seed data still serving")
     finally:
-        _REFRESH_RUNNING = False
+        with _REFRESH_LOCK: _REFRESHING = False
 
 
-# Start background refresh on startup (non-blocking, seed data serves immediately)
-_REFRESH_RUNNING = True
-_threading.Thread(target=_refresh_with_yfinance, daemon=True).start()
+# Start background refresh if API key exists
+if TWELVE_DATA_KEY:
+    _REFRESHING = True
+    _threading.Thread(target=_fetch_twelve_data, daemon=True).start()
+else:
+    print("[ROBU] screener: No TWELVE_DATA_API_KEY — serving 50 seed stocks. Add key to Railway env vars for live data.")
 
 
 @app.get("/screener-v2")
 def stock_screener_v2(
-    min_roe: float = 0, max_pe: float = 9999, min_net_margin: float = -999,
-    max_debt_equity: float = 9999, min_market_cap: float = 0, max_market_cap: float = 9999999,
-    min_rev_growth: float = -999, min_roce: float = 0, sector: str = "",
-    sort_by: str = "marketCap", order: str = "desc", limit: int = 60,
+    min_roe:float=0, max_pe:float=9999, min_net_margin:float=-999,
+    max_debt_equity:float=9999, min_market_cap:float=0, max_market_cap:float=9999999,
+    min_rev_growth:float=-999, min_roce:float=0, sector:str="",
+    sort_by:str="marketCap", order:str="desc", limit:int=60,
 ):
-    # Trigger refresh if cache is older than 6 hours
-    global _REFRESH_RUNNING
-    if not _REFRESH_RUNNING and time.time() - _LAST_REFRESH > 21600:
-        _REFRESH_RUNNING = True
-        _threading.Thread(target=_refresh_with_yfinance, daemon=True).start()
+    global _REFRESHING
+    # Trigger daily refresh
+    if not _REFRESHING and TWELVE_DATA_KEY and time.time() - _LAST_REFRESH > 86400:
+        with _REFRESH_LOCK:
+            if not _REFRESHING:
+                _REFRESHING = True
+                _threading.Thread(target=_fetch_twelve_data, daemon=True).start()
 
     # Query cache
     qkey = _hashlib.md5(f"{min_roe}{max_pe}{min_net_margin}{max_debt_equity}{min_market_cap}{max_market_cap}{min_rev_growth}{min_roce}{sector}{sort_by}{order}{limit}".encode()).hexdigest()
-    if qkey in _QUERY_CACHE and time.time() - _QUERY_TS.get(qkey, 0) < _QUERY_TTL:
+    if qkey in _QUERY_CACHE and time.time() - _QUERY_TS.get(qkey,0) < _QUERY_TTL:
         return _QUERY_CACHE[qkey]
 
     with _CACHE_LOCK:
-        data = list(_LIVE_CACHE)
+        data = list(_SCREENER_CACHE)
 
     filtered = []
     for s in data:
-        if s["roe"] < min_roe: continue
-        if max_pe < 9999 and (not s["pe"] or s["pe"] > max_pe): continue
-        if s["netMargin"] < min_net_margin: continue
-        if max_debt_equity < 9999 and s["debtToEquity"] > max_debt_equity: continue
-        if s["marketCap"] > 0 and s["marketCap"] < min_market_cap: continue
-        if s["marketCap"] > 0 and s["marketCap"] > max_market_cap: continue
-        if min_rev_growth > -999 and s["revenueGrowth5Y"] < min_rev_growth: continue
-        if min_roce > 0 and s["roce"] < min_roce: continue
-        if sector and sector.lower() not in (s.get("sector") or "").lower(): continue
+        if s.get("roe",0) < min_roe: continue
+        if max_pe < 9999 and (not s.get("pe") or s["pe"] > max_pe): continue
+        if s.get("netMargin",0) < min_net_margin: continue
+        if max_debt_equity < 9999 and s.get("debtToEquity",0) > max_debt_equity: continue
+        mc = s.get("marketCap",0)
+        if mc > 0 and mc < min_market_cap: continue
+        if mc > 0 and mc > max_market_cap: continue
+        if min_rev_growth > -999 and s.get("revenueGrowth5Y",0) < min_rev_growth: continue
+        if min_roce > 0 and s.get("roce",0) < min_roce: continue
+        if sector and sector.lower() not in (s.get("sector","")).lower(): continue
         filtered.append(s)
 
     sk = {"Market Capitalization":"marketCap","Return on equity":"roe","Price to Earning":"pe",
           "Net profit margin":"netMargin","Sales growth 5Years":"revenueGrowth5Y",
           "Return on capital employed":"roce","marketCap":"marketCap","roe":"roe","score":"score"}.get(sort_by,"marketCap")
-    filtered.sort(key=lambda x: (x.get(sk) or 0), reverse=(order=="desc"))
+    filtered.sort(key=lambda x:(x.get(sk) or 0), reverse=(order=="desc"))
     result = filtered[:limit]
 
     _QUERY_CACHE[qkey] = result
     _QUERY_TS[qkey] = time.time()
-    print(f"[ROBU] screener: {len(result)} results from {len(data)} cached stocks")
+    print(f"[ROBU] screener: {len(result)} results (cache: {len(data)} stocks, api_key: {'yes' if TWELVE_DATA_KEY else 'no'})")
     return result
 
 
 @app.get("/screener-status")
 def screener_status():
-    with _CACHE_LOCK:
-        count = len(_LIVE_CACHE)
-    return {"cached": count, "refreshing": _REFRESH_RUNNING,
-            "last_refresh_mins": round((time.time()-_LAST_REFRESH)/60,1) if _LAST_REFRESH else None,
-            "seed_count": len(_SEED_DATA)}
+    with _CACHE_LOCK: count = len(_SCREENER_CACHE)
+    return {"cached_stocks": count, "seed_stocks": len(_SEED),
+            "api_key_set": bool(TWELVE_DATA_KEY), "refreshing": _REFRESHING,
+            "last_refresh_hours": round((time.time()-_LAST_REFRESH)/3600,1) if _LAST_REFRESH else None}
