@@ -7,3 +7,4 @@ python-multipart==0.0.9
 curl_cffi==0.6.2
 beautifulsoup4==4.12.3
 lxml==5.2.2
+yfinance==0.2.40

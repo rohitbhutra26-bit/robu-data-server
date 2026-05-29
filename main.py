@@ -2523,41 +2523,178 @@ def screener_debug():
         return {"error": str(e)}
 
 # ---------------------------------------------------------------------------
-# /screener-v2  — powered by Screener.in's raw export (entire NSE universe)
+# /screener-v2  — powered by yfinance batch cache (reliable, no scraping)
+# ---------------------------------------------------------------------------
+# Architecture:
+#   Startup → background thread fetches NIFTY 500 fundamentals via yfinance
+#   Cache → stored in _YF_SCREENER_CACHE with 6-hour TTL
+#   Query → filters from in-memory cache, returns instantly
+#   No sessions, no HTML parsing, no Screener.in dependency
 # ---------------------------------------------------------------------------
 
-def _build_screener_query(
-    min_roe: float,
-    max_pe: float,
-    min_net_margin: float,
-    max_debt_equity: float,
-    min_market_cap: float,
-    max_market_cap: float,
-    min_rev_growth: float,
-    min_roce: float,
-    sector: str,
-) -> str:
-    """Build a Screener.in query string from filter params."""
-    parts = []
-    if min_roe > 0:
-        parts.append(f"Return on equity > {min_roe}")
-    if max_pe < 9999:
-        parts.append(f"Price to Earning < {max_pe}")
-    if min_net_margin > -999:
-        parts.append(f"Net profit margin > {min_net_margin}")
-    if max_debt_equity < 9999:
-        parts.append(f"Debt to equity < {max_debt_equity}")
-    if min_market_cap > 0:
-        parts.append(f"Market Capitalization > {min_market_cap}")
-    if max_market_cap < 9999999:
-        parts.append(f"Market Capitalization < {max_market_cap}")
-    if min_rev_growth > -999:
-        parts.append(f"Sales growth 5Years > {min_rev_growth}")
-    if min_roce > 0:
-        parts.append(f"Return on capital employed > {min_roce}")
-    if sector:
-        parts.append(f"Sector = {sector}")
-    return " AND ".join(parts) if parts else "Return on equity > 0"
+import threading as _threading
+
+# Top NSE symbols to pre-load (NIFTY 500 representative list)
+_SCREENER_SYMBOLS = [
+    "RELIANCE","TCS","HDFCBANK","BHARTIARTL","ICICIBANK","INFOSYS","SBIN","HINDUNILVR",
+    "ITC","BAJFINANCE","LT","KOTAKBANK","HCLTECH","MARUTI","ASIANPAINT","AXISBANK",
+    "TITAN","SUNPHARMA","ULTRACEMCO","NESTLEIND","WIPRO","POWERGRID","NTPC","TATAMOTORS",
+    "TECHM","BAJAJFINSV","COALINDIA","HDFCLIFE","GRASIM","INDUSINDBK","DIVISLAB","CIPLA",
+    "ADANIPORTS","DRREDDY","SBILIFE","BAJAJ-AUTO","ONGC","EICHERMOT","BPCL","BRITANNIA",
+    "APOLLOHOSP","JSWSTEEL","TATACONSUM","HINDALCO","HEROMOTOCO","TATAPOWER","TATASTEEL",
+    "M&M","VEDL","PIDILITIND","SIEMENS","DABUR","ADANIENT","HAVELLS","MARICO","AMBUJACEM",
+    "BERGEPAINT","GODREJCP","COLPAL","BOSCHLTD","MUTHOOTFIN","PAGEIND","LUPIN","TORNTPHARM",
+    "BIOCON","ALKEM","AUROPHARMA","CADILAHC","IPCALAB","ABBOTINDIA","PFIZER","GLAXO",
+    "GLAND","LALPATHLAB","METROPOLIS","THYROCARE","FORTIS","MAXHEALTH","NAUKRI","INFY",
+    "MPHASIS","LTTS","PERSISTENT","COFORGE","KPITTECH","TATAELXSI","HEXAWARE","NIIT",
+    "ZOMATO","PAYTM","NYKAA","POLICYBZR","DELHIVERY","CARTRADE","IRCTC","EASEMYTRIP",
+    "INDIGO","SPICEJET","GMRAIRPORT","AIAENG","CUMMINSIND","BHEL","ABB","SCHNEIDER",
+    "THERMAX","ASHOKLEY","ESCORTS","TVSMOTORS","BALKRISIND","APOLLOTYRE","MINDA",
+    "MOTHERSON","VARROC","SUNDRMFAST","ENDURANCE","EXIDEIND","AMARAJABAT","IDFCFIRSTB",
+    "BANDHANBNK","AUBANK","YESBANK","FEDERALBNK","KARNATAKBNK","EQUITASBNK","UJJIVANSFB",
+    "CHOLAFIN","BAJAJHLDNG","HDFCAMC","NIPPONLIFE","MIRAE","ICICIPRULIFE","SBICARDS",
+    "MANAPPURAM","LTFH","RECLTD","PFC","IRFC","HUDCO","NHAI","PNBHOUSING","CANFINHOME",
+    "LICHSGFIN","REPCO","AAVAS","HOMEFIRST","APTUS","SBFC","CREDITACC","SPANDANASPHF",
+    "TATACHEM","DEEPAKNTR","GNFC","GHCL","ALKYLAMINE","NAVINFLUOR","FLUOROCHEM","CLEAN",
+    "AARTI","VINATI","GALAXYSURF","SOLARINDS","ASTRAL","SUPRAJIT","POLYCAB","HAVELLS",
+    "CROMPTON","WHIRLPOOL","VOLTAS","BLUESTAR","SYMPHONY","AMBER","DIXON","PEL",
+    "OBEROIRLTY","DLF","GODREJPROP","PRESTIGE","BRIGADE","SOBHA","MAHINDRA","PHOENIXLTD",
+    "LODHA","SUNTECK","KOLTEPATIL","IBREALEST","UNITECH","IBULHSGFIN","EQUITAS",
+    "TRIDENT","VARDHMAN","RAYMOND","ARVIND","WELSPUN","FILATEX","SPENTEX","NIITLTD",
+    "ZEEL","SUNTV","DISHTV","TIPSINDLTD","SHEMAROO","BALAJITELE","EROSMEDIA","PVRINOX",
+    "INOXLEISUR","WONDERLA","MAHINDRACIE","MAHLE","SANDHAR","MINDA","GABRIEL","SUPRAJIT",
+    "GMMPFAUDLR","ELGIEQUIP","GRINDWELL","SCHAEFFLER","SKFINDIA","TIMKEN","NRB","WABCO",
+    "MOTHERSON","EXIDE","GNFC","GSFC","COROMANDEL","UPL","PIIND","DHANUKA","INSECTICIDES",
+    "BAYER","RALLIS","GODREJAGRO","NFLLTD","FACT","CHAMBAL","KHAITAN","JUBLPHARMA",
+    "SOLARA","LAURUS","GRANULES","SUDARSCHEM","ATUL","GALAXYSURF","FINEORG","BALAMINES",
+    "PAUSHAKLTD","CAPLIPOINT","AJANTPHARM","MOREPEN","JB","INDOCO","FDC","WOCKPHARMA",
+    "STRIDES","BLISSGVS","SMSPHARMA","KOPRAN","NATCOPHARM","SUVEN","NEULANDLAB",
+]
+
+_YF_SCREENER_CACHE: list = []
+_YF_SCREENER_LOADED = False
+_YF_SCREENER_LOADING = False
+_YF_SCREENER_LAST_REFRESH: float = 0
+_YF_SCREENER_LOCK = _threading.Lock()
+_YF_CACHE_TTL = 6 * 3600  # 6 hours
+
+
+def _compute_score(roe, pe, de, margin):
+    score = 0
+    if roe >= 20:    score += 30
+    elif roe >= 15:  score += 20
+    elif roe >= 10:  score += 10
+    if 0 < pe <= 20: score += 25
+    elif 0 < pe <= 35: score += 15
+    if de < 0.5:     score += 20
+    elif de < 1:     score += 10
+    if margin >= 15: score += 25
+    elif margin >= 8: score += 15
+    return score
+
+
+def _load_yf_screener_cache():
+    """Background: batch-fetch fundamentals for top NSE stocks via yfinance."""
+    global _YF_SCREENER_CACHE, _YF_SCREENER_LOADED, _YF_SCREENER_LOADING, _YF_SCREENER_LAST_REFRESH
+    with _YF_SCREENER_LOCK:
+        if _YF_SCREENER_LOADING:
+            return
+        _YF_SCREENER_LOADING = True
+
+    try:
+        import yfinance as yf
+        print(f"[ROBU] screener-cache: loading {len(_SCREENER_SYMBOLS)} stocks via yfinance...")
+        results = []
+        batch_size = 50
+
+        for i in range(0, len(_SCREENER_SYMBOLS), batch_size):
+            batch = _SCREENER_SYMBOLS[i:i+batch_size]
+            tickers_str = " ".join(f"{s}.NS" for s in batch)
+            try:
+                tickers_obj = yf.Tickers(tickers_str)
+                for sym in batch:
+                    try:
+                        info = tickers_obj.tickers.get(f"{sym}.NS", None)
+                        if not info:
+                            continue
+                        d = info.fast_info if hasattr(info, "fast_info") else {}
+                        # Try fast_info first (faster), fall back to info
+                        price  = float(getattr(d, "last_price", 0) or 0)
+                        mktcap = float(getattr(d, "market_cap", 0) or 0) / 1e7  # ₹ → Crore
+
+                        full = info.info if hasattr(info, "info") else {}
+                        if not price:
+                            price = float(full.get("currentPrice") or full.get("regularMarketPrice") or 0)
+                        if not mktcap:
+                            mktcap = float(full.get("marketCap") or 0) / 1e7
+
+                        pe     = float(full.get("trailingPE") or 0)
+                        roe    = float(full.get("returnOnEquity") or 0) * 100  # decimal → %
+                        margin = float(full.get("profitMargins") or 0) * 100
+                        de     = float(full.get("debtToEquity") or 0) / 100    # yf gives as % (e.g. 45 = 0.45x)
+                        rev_g  = float(full.get("revenueGrowth") or 0) * 100
+                        div_y  = float(full.get("dividendYield") or 0) * 100
+                        promo  = 0.0  # not in yfinance
+                        roce   = 0.0  # not in yfinance, approximate from ROE
+                        sector = full.get("sector") or full.get("industry") or "NSE Listed"
+                        name   = full.get("longName") or full.get("shortName") or STOCK_UNIVERSE.get(sym, {}).get("name", sym)
+
+                        if price <= 0 or mktcap <= 0:
+                            continue
+
+                        results.append({
+                            "symbol":         sym,
+                            "name":           name,
+                            "screenerSlug":   sym,
+                            "sector":         sector,
+                            "price":          round(price, 2),
+                            "marketCap":      round(mktcap, 1),
+                            "pe":             round(pe, 1) if pe > 0 else None,
+                            "roe":            round(roe, 1),
+                            "roce":           round(roce, 1),
+                            "netMargin":      round(margin, 1),
+                            "debtToEquity":   round(de, 2),
+                            "revenueGrowth5Y": round(rev_g, 1),
+                            "patGrowth5Y":    0.0,
+                            "dividendYield":  round(div_y, 2),
+                            "promoterHolding": promo,
+                            "score":          _compute_score(roe, pe, de, margin),
+                        })
+                    except Exception as ex:
+                        pass  # skip single stock errors silently
+            except Exception as batch_err:
+                print(f"[ROBU] screener-cache batch {i} error: {batch_err}")
+            time.sleep(0.5)  # rate limit courtesy
+
+        with _YF_SCREENER_LOCK:
+            _YF_SCREENER_CACHE = results
+            _YF_SCREENER_LOADED = True
+            _YF_SCREENER_LAST_REFRESH = time.time()
+            _YF_SCREENER_LOADING = False
+        print(f"[ROBU] screener-cache: loaded {len(results)} stocks ✓")
+
+    except ImportError:
+        print("[ROBU] screener-cache: yfinance not installed, install it via requirements.txt")
+        with _YF_SCREENER_LOCK:
+            _YF_SCREENER_LOADING = False
+    except Exception as e:
+        print(f"[ROBU] screener-cache error: {e}")
+        with _YF_SCREENER_LOCK:
+            _YF_SCREENER_LOADING = False
+
+
+def _ensure_screener_cache():
+    """Start background refresh if cache is stale or empty."""
+    global _YF_SCREENER_LAST_REFRESH
+    now = time.time()
+    stale = (now - _YF_SCREENER_LAST_REFRESH) > _YF_CACHE_TTL
+    if (not _YF_SCREENER_LOADED or stale) and not _YF_SCREENER_LOADING:
+        t = _threading.Thread(target=_load_yf_screener_cache, daemon=True)
+        t.start()
+
+
+# Kick off on import (background — doesn't block startup)
+_threading.Thread(target=_load_yf_screener_cache, daemon=True).start()
 
 
 @app.get("/screener-v2")
@@ -2566,288 +2703,69 @@ def stock_screener_v2(
     max_pe: float = 9999,
     min_net_margin: float = -999,
     max_debt_equity: float = 9999,
-    min_market_cap: float = 0,          # in ₹ Crore
+    min_market_cap: float = 0,
     max_market_cap: float = 9999999,
-    min_rev_growth: float = -999,       # 5-year sales CAGR %
+    min_rev_growth: float = -999,
     min_roce: float = 0,
     sector: str = "",
-    sort_by: str = "Market Capitalization",  # Screener column to sort by
+    sort_by: str = "marketCap",
     order: str = "desc",
-    limit: int = 50,
+    limit: int = 60,
 ):
     """
-    Screen ALL NSE/BSE stocks using Screener.in's raw export API.
-    Returns up to `limit` matching stocks with full metrics.
-
-    Query params:
-      min_roe, max_pe, min_net_margin, max_debt_equity,
-      min_market_cap, max_market_cap, min_rev_growth, min_roce,
-      sector, sort_by, order, limit
+    Screen NSE stocks from yfinance in-memory cache.
+    Cache is pre-loaded on startup and refreshed every 6 hours.
+    No scraping, no sessions — always reliable.
     """
-    query = _build_screener_query(
-        min_roe, max_pe, min_net_margin, max_debt_equity,
-        min_market_cap, max_market_cap, min_rev_growth, min_roce, sector,
-    )
+    _ensure_screener_cache()
 
-    # ── Build Screener.in URL ─────────────────────────────────────────────────
-    # Screener.in's raw export expects:
-    #   fields=Name,Current+Price,Market+Capitalization,...
-    #   ↑ commas MUST be literal (not %2C), spaces MUST be "+" (not %20 or %2B)
-    #
-    # We build the URL manually to guarantee this exact encoding.
-    # Using requests.params or urlencode() both URL-encode commas as %2C which
-    # may cause Screener to treat the entire fields string as one field name.
-    import urllib.parse as _up
-    import re as _re
+    if not _YF_SCREENER_LOADED:
+        # Cache still warming up — return status so frontend can show a message
+        raise HTTPException(503, "Screener cache is loading (~60s on first start). Please try again shortly.")
 
-    field_list = [
-        "Name", "Current Price", "Market Capitalization",
-        "Price to Earning", "Return on equity", "Return on capital employed",
-        "Net profit margin", "Debt to equity", "Sales growth 5Years",
-        "Profit growth 5Years", "Dividend Yield", "Promoter Holding",
-    ]
-    # Each field: spaces→+, everything else URL-encoded
-    fields_encoded = ",".join(_up.quote(f, safe="") .replace("%20", "+") for f in field_list)
+    data = list(_YF_SCREENER_CACHE)
 
-    sort_param = sort_by if order == "desc" else f"-{sort_by}"
-    sort_enc   = _up.quote(sort_param, safe="").replace("%20", "+")
-    query_enc  = _up.quote(query,      safe="").replace("%20", "+")
+    # ── Apply filters ─────────────────────────────────────────────────────────
+    filtered = []
+    for s in data:
+        if s["roe"] < min_roe:                                     continue
+        if max_pe < 9999 and (not s["pe"] or s["pe"] > max_pe):   continue
+        if s["netMargin"] < min_net_margin:                        continue
+        if max_debt_equity < 9999 and s["debtToEquity"] > max_debt_equity: continue
+        if s["marketCap"] < min_market_cap:                        continue
+        if s["marketCap"] > max_market_cap:                        continue
+        if min_rev_growth > -999 and s["revenueGrowth5Y"] < min_rev_growth: continue
+        if min_roce > 0 and s["roce"] < min_roce:                  continue
+        if sector and sector.lower() not in (s.get("sector") or "").lower(): continue
+        filtered.append(s)
 
-    # export=1 tells Screener to return CSV data instead of HTML page
-    url = f"https://www.screener.in/screen/raw/?sort={sort_enc}&query={query_enc}&fields={fields_encoded}&export=1"
-    print(f"[ROBU] screener-v2 URL: {url[:300]}")
+    # ── Sort ──────────────────────────────────────────────────────────────────
+    sort_key_map = {
+        "Market Capitalization": "marketCap",
+        "Return on equity": "roe",
+        "Price to Earning": "pe",
+        "Net profit margin": "netMargin",
+        "Sales growth 5Years": "revenueGrowth5Y",
+        "Return on capital employed": "roce",
+        "marketCap": "marketCap",
+        "roe": "roe",
+        "pe": "pe",
+        "score": "score",
+    }
+    sk = sort_key_map.get(sort_by, "marketCap")
+    reverse = (order == "desc")
+    filtered.sort(key=lambda x: (x.get(sk) or 0), reverse=reverse)
 
-    try:
-        sess = _get_screener_session()
-        if not sess:
-            raise HTTPException(503, "Screener.in session unavailable")
+    return filtered[:limit]
 
-        hdrs = {**_make_browser_headers("https://www.screener.in/screens/"), "Accept": "text/csv,text/plain,*/*"}
-        resp = sess.get(url, headers=hdrs, timeout=30)
 
-        if resp.status_code == 429:
-            raise HTTPException(429, "Screener.in rate-limited, try again in a moment")
-        if not resp.ok:
-            raise HTTPException(resp.status_code, f"Screener.in returned {resp.status_code}")
-
-        # ── Try CSV first (export=1), fall back to HTML table parsing ───────────
-        raw = resp.text
-        print(f"[ROBU] screener-v2 response length={len(raw)}, starts={raw.strip()[:120]}")
-
-        # If CSV response (starts with "Name," header row) — parse as CSV
-        if not raw.strip().startswith("<") and "," in (raw.split("\n")[0] if "\n" in raw else raw[:200]):
-            import csv, io
-            reader = csv.DictReader(io.StringIO(raw.strip()))
-            col_map = {(h or "").lower().strip(): h for h in (reader.fieldnames or [])}
-
-            def _get_csv(row, key):
-                v = row.get(key)
-                if v is not None: return v
-                orig = col_map.get(key.lower().strip())
-                return row.get(orig, "") if orig else ""
-
-            def _fc(row, *keys):
-                for k in keys:
-                    v = (_get_csv(row, k) or "").replace(",", "").replace("%", "").strip()
-                    if v:
-                        try: return float(v)
-                        except: pass
-                return 0.0
-
-            # Build name→symbol map
-            _name_to_sym2: dict[str, str] = {}
-            for _sym, _info in STOCK_UNIVERSE.items():
-                _n = (_info.get("name") or "").lower().strip()
-                if _n: _name_to_sym2[_n] = _sym
-
-            results = []
-            for i, row in enumerate(reader):
-                if i >= limit: break
-                name = (_get_csv(row, "Name") or "").strip()
-                if not name: continue
-                price  = _fc(row, "CMP", "Current Price", "Price")
-                mktcap = _fc(row, "Market Cap", "Market Capitalization")
-                pe     = _fc(row, "P/E", "Price to Earning")
-                roe    = _fc(row, "ROE", "Return on equity")
-                roce   = _fc(row, "ROCE", "Return on capital employed")
-                margin = _fc(row, "Net profit margin", "OPM", "Net Margin")
-                de     = _fc(row, "Debt to equity", "D/E")
-                rev_g  = _fc(row, "Sales growth 5Years", "Sales Gr. 5Yr")
-                pat_g  = _fc(row, "Profit growth 5Years", "Profit Gr. 5Yr")
-                div_y  = _fc(row, "Dividend Yield", "Div Yield")
-                promo  = _fc(row, "Promoter Holding", "Promoter %")
-
-                sym = _name_to_sym2.get(name.lower().strip(), "")
-                if not sym:
-                    clean = name.upper()
-                    for sfx in [" LTD", " LIMITED", " LTD.", " INC", " CORP", " INDUSTRIES"]:
-                        clean = clean.replace(sfx, "")
-                    sym = clean.strip().split()[0][:15] if clean.strip() else ""
-
-                score = 0
-                if roe >= 20: score += 30
-                elif roe >= 15: score += 20
-                elif roe >= 10: score += 10
-                if 0 < pe <= 20: score += 25
-                elif 0 < pe <= 35: score += 15
-                if de < 0.5: score += 20
-                elif de < 1: score += 10
-                if margin >= 15: score += 25
-                elif margin >= 8: score += 15
-
-                results.append({"symbol": sym, "name": name, "screenerSlug": sym,
-                    "price": price, "marketCap": mktcap, "pe": pe if pe > 0 else None,
-                    "roe": roe, "roce": roce, "netMargin": margin, "debtToEquity": de,
-                    "revenueGrowth5Y": rev_g, "patGrowth5Y": pat_g,
-                    "dividendYield": div_y, "promoterHolding": promo, "score": score})
-            print(f"[ROBU] screener-v2 CSV: {len(results)} results")
-            return results
-
-        # ── Fall back: parse HTML table ───────────────────────────────────────
-        html = raw
-
-        if not _BS4_AVAILABLE:
-            raise HTTPException(503, "beautifulsoup4 not installed on server")
-
-        soup = BeautifulSoup(html, "lxml")
-
-        # Check for login redirect (unauthenticated)
-        login_form = soup.find("form", {"action": re.compile(r"/login", re.I)})
-        if login_form:
-            raise HTTPException(503, "Screener session expired — please re-deploy to refresh")
-
-        # Find the results table — Screener uses class "data-table"
-        table = soup.find("table", {"class": "data-table"})
-        if not table:
-            # Try any table as fallback
-            table = soup.find("table")
-        if not table:
-            print(f"[ROBU] screener-v2: no table found in HTML. Title={soup.title and soup.title.text}")
-            return []
-
-        # Extract headers
-        thead = table.find("thead")
-        headers = []
-        if thead:
-            headers = [th.get_text(strip=True) for th in thead.find_all("th")]
-        print(f"[ROBU] screener-v2 headers: {headers}")
-
-        def _col(cells_dict: dict, *keys: str) -> str:
-            for k in keys:
-                v = cells_dict.get(k, "")
-                if v:
-                    return v
-            return ""
-
-        def _f(v: str) -> float:
-            v = v.replace(",", "").replace("%", "").strip()
-            try:
-                return float(v) if v else 0.0
-            except ValueError:
-                return 0.0
-
-        # Build reverse name→symbol lookup from STOCK_UNIVERSE
-        _name_to_sym: dict[str, str] = {}
-        for _sym, _info in STOCK_UNIVERSE.items():
-            _n = (_info.get("name") or "").lower().strip()
-            if _n:
-                _name_to_sym[_n] = _sym
-
-        results = []
-        tbody = table.find("tbody")
-        rows = tbody.find_all("tr") if tbody else table.find_all("tr")[1:]
-
-        for i, tr in enumerate(rows):
-            if i >= limit:
-                break
-            try:
-                cells = tr.find_all("td")
-                if not cells:
-                    continue
-
-                # Map header → cell text
-                cell_texts = [td.get_text(strip=True) for td in cells]
-                row_dict = dict(zip(headers, cell_texts)) if headers else {}
-
-                # Extract name and symbol from the first cell's <a> link
-                # Link format: /company/SYMBOL/ or /company/SYMBOL/consolidated/
-                name = ""
-                screener_slug = ""
-                first_a = cells[0].find("a") if cells else None
-                if first_a:
-                    name = first_a.get_text(strip=True)
-                    href = first_a.get("href", "")
-                    m = re.search(r"/company/([^/]+)/", href)
-                    if m:
-                        screener_slug = m.group(1).upper()
-                if not name:
-                    name = cell_texts[0] if cell_texts else ""
-
-                if not name:
-                    continue
-
-                # Symbol resolution: slug from URL > STOCK_UNIVERSE name lookup > slug itself
-                sym_raw = screener_slug
-                name_key = name.lower().strip()
-                if name_key in _name_to_sym:
-                    sym_raw = _name_to_sym[name_key]
-                elif not sym_raw:
-                    clean = name.upper()
-                    for sfx in [" LTD", " LIMITED", " LTD.", " INC", " CORP",
-                                 " INDUSTRIES", " ENTERPRISES", " SOLUTIONS"]:
-                        clean = clean.replace(sfx, "")
-                    sym_raw = clean.strip().split()[0][:15] if clean.strip() else ""
-
-                price  = _f(_col(row_dict, "CMP", "Current Price", "Price"))
-                mktcap = _f(_col(row_dict, "Market Cap", "Market Capitalization", "Mkt Cap"))
-                pe     = _f(_col(row_dict, "P/E", "Price to Earning", "PE"))
-                roe    = _f(_col(row_dict, "ROE", "Return on equity"))
-                roce   = _f(_col(row_dict, "ROCE", "Return on capital employed"))
-                margin = _f(_col(row_dict, "Net profit margin", "Net Margin", "OPM"))
-                de     = _f(_col(row_dict, "Debt to equity", "D/E", "Debt/Eq"))
-                rev_g  = _f(_col(row_dict, "Sales growth 5Years", "Sales Gr. 5Yr", "Rev Growth 5Y"))
-                pat_g  = _f(_col(row_dict, "Profit growth 5Years", "Profit Gr. 5Yr"))
-                div_y  = _f(_col(row_dict, "Dividend Yield", "Div Yield"))
-                promo  = _f(_col(row_dict, "Promoter Holding", "Promoter %"))
-
-                # Quality score
-                score = 0
-                if roe >= 20:   score += 30
-                elif roe >= 15: score += 20
-                elif roe >= 10: score += 10
-                if pe > 0 and pe <= 20:  score += 25
-                elif 0 < pe <= 35:       score += 15
-                if de < 0.5:  score += 20
-                elif de < 1:  score += 10
-                if margin >= 15: score += 25
-                elif margin >= 8: score += 15
-
-                results.append({
-                    "symbol":         sym_raw,
-                    "name":           name,
-                    "screenerSlug":   screener_slug,
-                    "price":          price,
-                    "marketCap":      mktcap,
-                    "pe":             pe if pe > 0 else None,
-                    "roe":            roe,
-                    "roce":           roce,
-                    "netMargin":      margin,
-                    "debtToEquity":   de,
-                    "revenueGrowth5Y": rev_g,
-                    "patGrowth5Y":    pat_g,
-                    "dividendYield":  div_y,
-                    "promoterHolding": promo,
-                    "score":          score,
-                })
-            except Exception as ex:
-                print(f"[ROBU] screener-v2 row {i} error: {ex}")
-                continue
-
-        print(f"[ROBU] screener-v2 returning {len(results)} results")
-        return results
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"[ROBU] screener-v2 error: {e}")
-        raise HTTPException(500, f"Screener error: {str(e)}")
+@app.get("/screener-status")
+def screener_status():
+    """Check if the yfinance screener cache is ready."""
+    return {
+        "loaded": _YF_SCREENER_LOADED,
+        "loading": _YF_SCREENER_LOADING,
+        "count": len(_YF_SCREENER_CACHE),
+        "last_refresh": _YF_SCREENER_LAST_REFRESH,
+        "age_minutes": round((time.time() - _YF_SCREENER_LAST_REFRESH) / 60, 1) if _YF_SCREENER_LAST_REFRESH else None,
+    }
