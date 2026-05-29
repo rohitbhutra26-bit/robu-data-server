@@ -1443,7 +1443,7 @@ def financials_v2(symbol: str):
     except Exception as e:
         print(f"[Screener] financials_v2 error for {symbol}: {e}")
 
-    if screener_data and len(screener_data) >= 2:
+    if screener_data and len(screener_data) >= 1:
         # Compute shares from Market Cap / Price (no Yahoo needed)
         try:
             cv2 = _cache_get(f"company_v2:{symbol}")
