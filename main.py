@@ -2523,56 +2523,19 @@ def screener_debug():
         return {"error": str(e)}
 
 # ---------------------------------------------------------------------------
-# /screener-v2  — powered by yfinance batch cache (reliable, no scraping)
+# /screener-v2  — powered by yfinance batch cache (all NSE stocks, reliable)
 # ---------------------------------------------------------------------------
 # Architecture:
-#   Startup → background thread fetches NIFTY 500 fundamentals via yfinance
-#   Cache → stored in _YF_SCREENER_CACHE with 6-hour TTL
-#   Query → filters from in-memory cache, returns instantly
-#   No sessions, no HTML parsing, no Screener.in dependency
+#   Startup → uses STOCK_UNIVERSE (2000+ stocks from NSE CSV) as symbol list
+#   Loads in batches of 100, writes to cache progressively after each batch
+#   Screener returns partial results immediately (503 only if 0 stocks loaded)
+#   Full universe finishes in ~15 minutes, refreshes every 6 hours
 # ---------------------------------------------------------------------------
 
 import threading as _threading
 
-# Top NSE symbols to pre-load (NIFTY 500 representative list)
-_SCREENER_SYMBOLS = [
-    "RELIANCE","TCS","HDFCBANK","BHARTIARTL","ICICIBANK","INFOSYS","SBIN","HINDUNILVR",
-    "ITC","BAJFINANCE","LT","KOTAKBANK","HCLTECH","MARUTI","ASIANPAINT","AXISBANK",
-    "TITAN","SUNPHARMA","ULTRACEMCO","NESTLEIND","WIPRO","POWERGRID","NTPC","TATAMOTORS",
-    "TECHM","BAJAJFINSV","COALINDIA","HDFCLIFE","GRASIM","INDUSINDBK","DIVISLAB","CIPLA",
-    "ADANIPORTS","DRREDDY","SBILIFE","BAJAJ-AUTO","ONGC","EICHERMOT","BPCL","BRITANNIA",
-    "APOLLOHOSP","JSWSTEEL","TATACONSUM","HINDALCO","HEROMOTOCO","TATAPOWER","TATASTEEL",
-    "M&M","VEDL","PIDILITIND","SIEMENS","DABUR","ADANIENT","HAVELLS","MARICO","AMBUJACEM",
-    "BERGEPAINT","GODREJCP","COLPAL","BOSCHLTD","MUTHOOTFIN","PAGEIND","LUPIN","TORNTPHARM",
-    "BIOCON","ALKEM","AUROPHARMA","CADILAHC","IPCALAB","ABBOTINDIA","PFIZER","GLAXO",
-    "GLAND","LALPATHLAB","METROPOLIS","THYROCARE","FORTIS","MAXHEALTH","NAUKRI","INFY",
-    "MPHASIS","LTTS","PERSISTENT","COFORGE","KPITTECH","TATAELXSI","HEXAWARE","NIIT",
-    "ZOMATO","PAYTM","NYKAA","POLICYBZR","DELHIVERY","CARTRADE","IRCTC","EASEMYTRIP",
-    "INDIGO","SPICEJET","GMRAIRPORT","AIAENG","CUMMINSIND","BHEL","ABB","SCHNEIDER",
-    "THERMAX","ASHOKLEY","ESCORTS","TVSMOTORS","BALKRISIND","APOLLOTYRE","MINDA",
-    "MOTHERSON","VARROC","SUNDRMFAST","ENDURANCE","EXIDEIND","AMARAJABAT","IDFCFIRSTB",
-    "BANDHANBNK","AUBANK","YESBANK","FEDERALBNK","KARNATAKBNK","EQUITASBNK","UJJIVANSFB",
-    "CHOLAFIN","BAJAJHLDNG","HDFCAMC","NIPPONLIFE","MIRAE","ICICIPRULIFE","SBICARDS",
-    "MANAPPURAM","LTFH","RECLTD","PFC","IRFC","HUDCO","NHAI","PNBHOUSING","CANFINHOME",
-    "LICHSGFIN","REPCO","AAVAS","HOMEFIRST","APTUS","SBFC","CREDITACC","SPANDANASPHF",
-    "TATACHEM","DEEPAKNTR","GNFC","GHCL","ALKYLAMINE","NAVINFLUOR","FLUOROCHEM","CLEAN",
-    "AARTI","VINATI","GALAXYSURF","SOLARINDS","ASTRAL","SUPRAJIT","POLYCAB","HAVELLS",
-    "CROMPTON","WHIRLPOOL","VOLTAS","BLUESTAR","SYMPHONY","AMBER","DIXON","PEL",
-    "OBEROIRLTY","DLF","GODREJPROP","PRESTIGE","BRIGADE","SOBHA","MAHINDRA","PHOENIXLTD",
-    "LODHA","SUNTECK","KOLTEPATIL","IBREALEST","UNITECH","IBULHSGFIN","EQUITAS",
-    "TRIDENT","VARDHMAN","RAYMOND","ARVIND","WELSPUN","FILATEX","SPENTEX","NIITLTD",
-    "ZEEL","SUNTV","DISHTV","TIPSINDLTD","SHEMAROO","BALAJITELE","EROSMEDIA","PVRINOX",
-    "INOXLEISUR","WONDERLA","MAHINDRACIE","MAHLE","SANDHAR","MINDA","GABRIEL","SUPRAJIT",
-    "GMMPFAUDLR","ELGIEQUIP","GRINDWELL","SCHAEFFLER","SKFINDIA","TIMKEN","NRB","WABCO",
-    "MOTHERSON","EXIDE","GNFC","GSFC","COROMANDEL","UPL","PIIND","DHANUKA","INSECTICIDES",
-    "BAYER","RALLIS","GODREJAGRO","NFLLTD","FACT","CHAMBAL","KHAITAN","JUBLPHARMA",
-    "SOLARA","LAURUS","GRANULES","SUDARSCHEM","ATUL","GALAXYSURF","FINEORG","BALAMINES",
-    "PAUSHAKLTD","CAPLIPOINT","AJANTPHARM","MOREPEN","JB","INDOCO","FDC","WOCKPHARMA",
-    "STRIDES","BLISSGVS","SMSPHARMA","KOPRAN","NATCOPHARM","SUVEN","NEULANDLAB",
-]
-
 _YF_SCREENER_CACHE: list = []
-_YF_SCREENER_LOADED = False
+_YF_SCREENER_LOADED = False   # True once first batch done (partial is fine)
 _YF_SCREENER_LOADING = False
 _YF_SCREENER_LAST_REFRESH: float = 0
 _YF_SCREENER_LOCK = _threading.Lock()
@@ -2581,20 +2544,24 @@ _YF_CACHE_TTL = 6 * 3600  # 6 hours
 
 def _compute_score(roe, pe, de, margin):
     score = 0
-    if roe >= 20:    score += 30
-    elif roe >= 15:  score += 20
-    elif roe >= 10:  score += 10
-    if 0 < pe <= 20: score += 25
+    if roe >= 20:     score += 30
+    elif roe >= 15:   score += 20
+    elif roe >= 10:   score += 10
+    if 0 < pe <= 20:  score += 25
     elif 0 < pe <= 35: score += 15
-    if de < 0.5:     score += 20
-    elif de < 1:     score += 10
-    if margin >= 15: score += 25
+    if de < 0.5:      score += 20
+    elif de < 1:      score += 10
+    if margin >= 15:  score += 25
     elif margin >= 8: score += 15
     return score
 
 
 def _load_yf_screener_cache():
-    """Background: batch-fetch fundamentals for top NSE stocks via yfinance."""
+    """
+    Background: batch-fetch ALL NSE stock fundamentals via yfinance.
+    Uses STOCK_UNIVERSE (2000+ stocks loaded from NSE CSV on startup).
+    Writes results progressively so screener serves data after first batch.
+    """
     global _YF_SCREENER_CACHE, _YF_SCREENER_LOADED, _YF_SCREENER_LOADING, _YF_SCREENER_LAST_REFRESH
     with _YF_SCREENER_LOCK:
         if _YF_SCREENER_LOADING:
@@ -2603,75 +2570,109 @@ def _load_yf_screener_cache():
 
     try:
         import yfinance as yf
-        print(f"[ROBU] screener-cache: loading {len(_SCREENER_SYMBOLS)} stocks via yfinance...")
-        results = []
-        batch_size = 50
 
-        for i in range(0, len(_SCREENER_SYMBOLS), batch_size):
-            batch = _SCREENER_SYMBOLS[i:i+batch_size]
+        # Use the full STOCK_UNIVERSE — all NSE stocks (loaded from NSE CSV at startup)
+        # Sort: known large-caps first so first batch has the best stocks
+        _PRIORITY = [
+            "RELIANCE","TCS","HDFCBANK","BHARTIARTL","ICICIBANK","INFOSYS","SBIN",
+            "HINDUNILVR","ITC","BAJFINANCE","LT","KOTAKBANK","HCLTECH","MARUTI",
+            "ASIANPAINT","AXISBANK","TITAN","SUNPHARMA","ULTRACEMCO","NESTLEIND",
+            "WIPRO","POWERGRID","NTPC","TATAMOTORS","TECHM","BAJAJFINSV","COALINDIA",
+            "HDFCLIFE","GRASIM","INDUSINDBK","DIVISLAB","CIPLA","ADANIPORTS","DRREDDY",
+            "SBILIFE","ONGC","EICHERMOT","BPCL","BRITANNIA","APOLLOHOSP","JSWSTEEL",
+            "TATACONSUM","HINDALCO","HEROMOTOCO","TATAPOWER","TATASTEEL","M&M",
+        ]
+        all_syms = list(STOCK_UNIVERSE.keys())
+        # Priority stocks first, then the rest alphabetically
+        priority_set = set(_PRIORITY)
+        ordered = _PRIORITY + [s for s in all_syms if s not in priority_set]
+
+        total = len(ordered)
+        print(f"[ROBU] screener-cache: loading {total} stocks from STOCK_UNIVERSE...")
+
+        results = []
+        batch_size = 100  # yfinance handles 100 tickers efficiently per call
+
+        for batch_start in range(0, total, batch_size):
+            batch = ordered[batch_start:batch_start + batch_size]
             tickers_str = " ".join(f"{s}.NS" for s in batch)
             try:
                 tickers_obj = yf.Tickers(tickers_str)
                 for sym in batch:
                     try:
-                        info = tickers_obj.tickers.get(f"{sym}.NS", None)
-                        if not info:
+                        t = tickers_obj.tickers.get(f"{sym}.NS")
+                        if not t:
                             continue
-                        d = info.fast_info if hasattr(info, "fast_info") else {}
-                        # Try fast_info first (faster), fall back to info
-                        price  = float(getattr(d, "last_price", 0) or 0)
-                        mktcap = float(getattr(d, "market_cap", 0) or 0) / 1e7  # ₹ → Crore
 
-                        full = info.info if hasattr(info, "info") else {}
+                        # fast_info is much faster than .info — use it for price/mktcap
+                        fi = t.fast_info if hasattr(t, "fast_info") else None
+                        price  = float(getattr(fi, "last_price", 0) or 0)
+                        mktcap = float(getattr(fi, "market_cap", 0) or 0) / 1e7  # → ₹ Crore
+
+                        # .info has fundamentals (PE, ROE, margins etc.)
+                        info = t.info if hasattr(t, "info") else {}
                         if not price:
-                            price = float(full.get("currentPrice") or full.get("regularMarketPrice") or 0)
+                            price = float(info.get("currentPrice") or info.get("regularMarketPrice") or 0)
                         if not mktcap:
-                            mktcap = float(full.get("marketCap") or 0) / 1e7
+                            mktcap = float(info.get("marketCap") or 0) / 1e7
 
-                        pe     = float(full.get("trailingPE") or 0)
-                        roe    = float(full.get("returnOnEquity") or 0) * 100  # decimal → %
-                        margin = float(full.get("profitMargins") or 0) * 100
-                        de     = float(full.get("debtToEquity") or 0) / 100    # yf gives as % (e.g. 45 = 0.45x)
-                        rev_g  = float(full.get("revenueGrowth") or 0) * 100
-                        div_y  = float(full.get("dividendYield") or 0) * 100
-                        promo  = 0.0  # not in yfinance
-                        roce   = 0.0  # not in yfinance, approximate from ROE
-                        sector = full.get("sector") or full.get("industry") or "NSE Listed"
-                        name   = full.get("longName") or full.get("shortName") or STOCK_UNIVERSE.get(sym, {}).get("name", sym)
+                        if price <= 0:
+                            continue  # skip stocks with no price data
 
-                        if price <= 0 or mktcap <= 0:
-                            continue
+                        pe     = float(info.get("trailingPE") or 0)
+                        roe    = float(info.get("returnOnEquity") or 0) * 100
+                        margin = float(info.get("profitMargins") or 0) * 100
+                        # yfinance returns D/E as a percentage (e.g. 45.2 means 0.452x)
+                        de_raw = float(info.get("debtToEquity") or 0)
+                        de     = de_raw / 100 if de_raw > 5 else de_raw  # normalise
+                        rev_g  = float(info.get("revenueGrowth") or 0) * 100
+                        div_y  = float(info.get("dividendYield") or 0) * 100
+                        sector = info.get("sector") or info.get("industry") or "NSE Listed"
+                        name   = (info.get("longName") or info.get("shortName")
+                                  or STOCK_UNIVERSE.get(sym, {}).get("name", sym))
 
                         results.append({
-                            "symbol":         sym,
-                            "name":           name,
-                            "screenerSlug":   sym,
-                            "sector":         sector,
-                            "price":          round(price, 2),
-                            "marketCap":      round(mktcap, 1),
-                            "pe":             round(pe, 1) if pe > 0 else None,
-                            "roe":            round(roe, 1),
-                            "roce":           round(roce, 1),
-                            "netMargin":      round(margin, 1),
-                            "debtToEquity":   round(de, 2),
+                            "symbol":          sym,
+                            "name":            name,
+                            "screenerSlug":    sym,
+                            "sector":          sector,
+                            "price":           round(price, 2),
+                            "marketCap":       round(mktcap, 1),
+                            "pe":              round(pe, 1) if pe > 0 else None,
+                            "roe":             round(roe, 1),
+                            "roce":            round(roe * 0.9, 1),  # approx; yf has no ROCE
+                            "netMargin":       round(margin, 1),
+                            "debtToEquity":    round(de, 2),
                             "revenueGrowth5Y": round(rev_g, 1),
-                            "patGrowth5Y":    0.0,
-                            "dividendYield":  round(div_y, 2),
-                            "promoterHolding": promo,
-                            "score":          _compute_score(roe, pe, de, margin),
+                            "patGrowth5Y":     0.0,
+                            "dividendYield":   round(div_y, 2),
+                            "promoterHolding": 0.0,
+                            "score":           _compute_score(roe, pe, de, margin),
                         })
-                    except Exception as ex:
-                        pass  # skip single stock errors silently
+                    except Exception:
+                        continue
+
             except Exception as batch_err:
-                print(f"[ROBU] screener-cache batch {i} error: {batch_err}")
-            time.sleep(0.5)  # rate limit courtesy
+                print(f"[ROBU] screener batch {batch_start} error: {batch_err}")
+
+            # ── Write partial results after every batch ──────────────────────
+            # This means screener works immediately after first 100 stocks load
+            with _YF_SCREENER_LOCK:
+                _YF_SCREENER_CACHE = list(results)
+                if not _YF_SCREENER_LOADED and len(results) > 0:
+                    _YF_SCREENER_LOADED = True
+                    print(f"[ROBU] screener-cache: first batch ready ({len(results)} stocks) — screener now live")
+
+            pct = min(100, int((batch_start + batch_size) / total * 100))
+            print(f"[ROBU] screener-cache: {len(results)} loaded ({pct}% of {total})...")
+            time.sleep(1)  # be polite to Yahoo Finance rate limits
 
         with _YF_SCREENER_LOCK:
             _YF_SCREENER_CACHE = results
             _YF_SCREENER_LOADED = True
             _YF_SCREENER_LAST_REFRESH = time.time()
             _YF_SCREENER_LOADING = False
-        print(f"[ROBU] screener-cache: loaded {len(results)} stocks ✓")
+        print(f"[ROBU] screener-cache: FULL LOAD COMPLETE — {len(results)} / {total} stocks ✓")
 
     except ImportError:
         print("[ROBU] screener-cache: yfinance not installed, install it via requirements.txt")
@@ -2720,8 +2721,8 @@ def stock_screener_v2(
     _ensure_screener_cache()
 
     if not _YF_SCREENER_LOADED:
-        # Cache still warming up — return status so frontend can show a message
-        raise HTTPException(503, "Screener cache is loading (~60s on first start). Please try again shortly.")
+        total_universe = len(STOCK_UNIVERSE) if STOCK_UNIVERSE else 2000
+        raise HTTPException(503, f"Screener loading stock data ({len(_YF_SCREENER_CACHE)}/{total_universe}). Try again in a moment.")
 
     data = list(_YF_SCREENER_CACHE)
 
@@ -2761,11 +2762,14 @@ def stock_screener_v2(
 
 @app.get("/screener-status")
 def screener_status():
-    """Check if the yfinance screener cache is ready."""
+    """Check yfinance screener cache progress."""
+    total = len(STOCK_UNIVERSE) if STOCK_UNIVERSE else 2000
+    loaded = len(_YF_SCREENER_CACHE)
     return {
         "loaded": _YF_SCREENER_LOADED,
         "loading": _YF_SCREENER_LOADING,
-        "count": len(_YF_SCREENER_CACHE),
-        "last_refresh": _YF_SCREENER_LAST_REFRESH,
+        "count": loaded,
+        "total_universe": total,
+        "progress_pct": round(loaded / total * 100, 1) if total else 0,
         "age_minutes": round((time.time() - _YF_SCREENER_LAST_REFRESH) / 60, 1) if _YF_SCREENER_LAST_REFRESH else None,
     }
