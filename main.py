@@ -2523,127 +2523,177 @@ def screener_debug():
         return {"error": str(e)}
 
 # ---------------------------------------------------------------------------
-# /screener-v2  — Spotify-style two-tier architecture
+# /screener-v2  — yfinance background pre-load (reliable, fast queries)
 # ---------------------------------------------------------------------------
-# Tier 1 (instant): NSE Bhavcopy index — symbol, name, price, market cap
-#   Already in STOCK_UNIVERSE (loaded from NSE CSV on startup, ~2000 stocks)
-#   Filter by market cap range instantly — no external calls needed
-#
-# Tier 2 (on-demand): Fundamentals — PE, ROE, margins, D/E
-#   Fetched ONLY for stocks that pass Tier 1 filter (typically 50-300 stocks)
-#   Cached per stock with 12hr TTL — never fetched twice in a day
-#   ~50 stocks × 0.3s = 15s first run, instant thereafter from cache
-#
-# Query cache: unique filter combination cached 1hr
-#   Same user runs same screen twice → instant second time
+# On startup: background thread loads top 300 NSE stocks via yfinance
+# Screener: filters from in-memory cache instantly — zero per-request fetching
+# Progressive: serves partial results as soon as first 100 stocks load
+# Refresh: every 6 hours automatically
 # ---------------------------------------------------------------------------
 
 import threading as _threading
 import hashlib as _hashlib
 
-# Per-stock fundamentals cache: {symbol: {data...}, ...}
-# Cached 12 hours — never bulk-loaded, only fetched when a screen needs it
-_FUND_CACHE: dict = {}
-_FUND_CACHE_TS: dict = {}
-_FUND_CACHE_TTL = 12 * 3600
-_FUND_LOCK = _threading.Lock()
+# ── Priority stock list (top 300 by market cap) ──────────────────────────────
+_SCREENER_TOP = [
+    "RELIANCE","TCS","HDFCBANK","BHARTIARTL","ICICIBANK","INFOSYS","SBIN","HINDUNILVR",
+    "ITC","BAJFINANCE","LT","KOTAKBANK","HCLTECH","MARUTI","ASIANPAINT","AXISBANK",
+    "TITAN","SUNPHARMA","ULTRACEMCO","NESTLEIND","WIPRO","POWERGRID","NTPC","TATAMOTORS",
+    "TECHM","BAJAJFINSV","COALINDIA","HDFCLIFE","GRASIM","INDUSINDBK","DIVISLAB","CIPLA",
+    "ADANIPORTS","DRREDDY","SBILIFE","BAJAJ-AUTO","ONGC","EICHERMOT","BPCL","BRITANNIA",
+    "APOLLOHOSP","JSWSTEEL","TATACONSUM","HINDALCO","HEROMOTOCO","TATAPOWER","TATASTEEL",
+    "M&M","VEDL","PIDILITIND","SIEMENS","DABUR","ADANIENT","HAVELLS","MARICO","AMBUJACEM",
+    "BERGEPAINT","GODREJCP","COLPAL","BOSCHLTD","MUTHOOTFIN","PAGEIND","LUPIN","TORNTPHARM",
+    "BIOCON","ALKEM","AUROPHARMA","IPCALAB","ABBOTINDIA","NAUKRI","MPHASIS","LTTS",
+    "PERSISTENT","COFORGE","KPITTECH","TATAELXSI","ZOMATO","PAYTM","NYKAA","IRCTC",
+    "INDIGO","IDFCFIRSTB","BANDHANBNK","AUBANK","YESBANK","FEDERALBNK","EQUITASBNK",
+    "CHOLAFIN","HDFCAMC","ICICIPRULIFE","SBICARDS","MANAPPURAM","RECLTD","PFC","IRFC",
+    "DLF","GODREJPROP","PRESTIGE","OBEROIRLTY","POLYCAB","ASTRAL","CROMPTON","DIXON",
+    "VOLTAS","BLUESTAR","AMBER","TATACHEM","DEEPAKNTR","GNFC","AARTI","VINATI","ASTRAL",
+    "COROMANDEL","UPL","PIIND","LAURUS","GRANULES","AJANTPHARM","TORNTPHARM","ALKEM",
+    "ABBOTINDIA","SANOFI","PFIZER","GLAXO","NATCOPHARM","STRIDES","AUROPHARMA","CADILAHC",
+    "GLAND","LALPATHLAB","METROPOLIS","FORTIS","MAXHEALTH","APOLLOHOSP","NARAYANAHLTC",
+    "ESCORTS","TVSMOTORS","BALKRISIND","APOLLOTYRE","MOTHERSON","EXIDEIND","AMARAJABAT",
+    "SUNDRMFAST","ENDURANCE","ASHOKLEY","BHARATFORG","CUMMINSIND","BHEL","ABB","THERMAX",
+    "TRIDENT","VARDHMAN","RAYMOND","WELSPUN","SUNTV","ZEEL","PVRINOX","INOXLEISUR",
+    "OBEROIRLTY","PHOENIXLTD","LODHA","BRIGADE","SOBHA","KOLTEPATIL","SUNTECK",
+    "CANFINHOME","LICHSGFIN","PNBHOUSING","AAVAS","HOMEFIRST","REPCO","RECLTD",
+    "HUDCO","IRFC","NHAI","NHPC","SJVN","TORNTPOWER","CESC","TATAPOWER","ADANIGREEN",
+    "ADANITRANS","ADANIPORTS","ADANIENT","ADANIGAS","ATGL","IGL","MGL","GUJGASLTD",
+    "PETRONET","GAIL","GSPL","HINDPETRO","MRPL","BPCL","ONGC","OIL","RELIANCE",
+    "TATASTEEL","JSWSTEEL","HINDALCO","VEDL","NATIONALUM","HINDZINC","COALINDIA",
+    "NMDC","MOIL","GMRAIRPORT","CONCOR","BLUEDART","DELHIVERY","TIINDIA",
+    "BAJAJHLDNG","CHOLAHLDNG","M&MFIN","SUNDARAM","SHRIRAMFIN","BAJAJFINSV",
+    "SBILIFE","HDFCLIFE","ICICIPRULIFE","MAXLIFE","LICINDIA","NIACL","GICRE",
+    "INFY","WIPRO","TCS","HCLTECH","TECHM","LTTS","MPHASIS","PERSISTENT","COFORGE",
+    "KPITTECH","TATAELXSI","HEXAWARE","NIIT","ORACLE","MASTEK","ZENSAR","MINFO",
+]
 
-# Query result cache: {query_hash: [results...], ...}
+_YF_CACHE: list = []           # pre-loaded stock data
+_YF_LOADED = False             # True once first batch done
+_YF_LOADING = False
+_YF_LAST_REFRESH: float = 0
+_YF_LOCK = _threading.Lock()
+_YF_TTL = 6 * 3600            # 6 hours
+
 _QUERY_CACHE: dict = {}
-_QUERY_CACHE_TS: dict = {}
-_QUERY_CACHE_TTL = 3600  # 1 hour
-
-
-def _get_fund_cached(symbol: str):
-    """Return cached fundamentals if fresh, else None."""
-    with _FUND_LOCK:
-        ts = _FUND_CACHE_TS.get(symbol, 0)
-        if time.time() - ts < _FUND_CACHE_TTL:
-            return _FUND_CACHE.get(symbol)
-    return None
-
-
-def _set_fund_cache(symbol: str, data: dict):
-    with _FUND_LOCK:
-        _FUND_CACHE[symbol] = data
-        _FUND_CACHE_TS[symbol] = time.time()
-
-
-def _fetch_fundamentals_batch(symbols: list) -> dict:
-    """
-    Fetch fundamentals for a batch of symbols via yfinance.
-    Returns {symbol: {pe, roe, margin, de, rev_growth, div_yield, sector}}
-    """
-    result = {}
-    if not symbols:
-        return result
-    try:
-        import yfinance as yf
-        tickers_str = " ".join(f"{s}.NS" for s in symbols)
-        tickers_obj = yf.Tickers(tickers_str)
-        for sym in symbols:
-            try:
-                t = tickers_obj.tickers.get(f"{sym}.NS")
-                if not t:
-                    continue
-                info = t.info if hasattr(t, "info") else {}
-                if not info:
-                    continue
-                # Get price from fast_info (more reliable)
-                fi = t.fast_info if hasattr(t, "fast_info") else None
-                price  = float(getattr(fi, "last_price", 0) or 0)
-                mktcap = float(getattr(fi, "market_cap", 0) or 0) / 1e7
-                if not price:
-                    price = float(info.get("currentPrice") or info.get("regularMarketPrice") or 0)
-                if not mktcap:
-                    mktcap = float(info.get("marketCap") or 0) / 1e7
-
-                pe     = float(info.get("trailingPE") or 0)
-                roe    = float(info.get("returnOnEquity") or 0) * 100
-                margin = float(info.get("profitMargins") or 0) * 100
-                de_raw = float(info.get("debtToEquity") or 0)
-                de     = de_raw / 100 if de_raw > 5 else de_raw
-                rev_g  = float(info.get("revenueGrowth") or 0) * 100
-                div_y  = float(info.get("dividendYield") or 0) * 100
-                sector = info.get("sector") or info.get("industry") or ""
-                name   = info.get("longName") or info.get("shortName") or ""
-
-                fund = {
-                    "price":          round(price, 2),
-                    "marketCap":      round(mktcap, 1),
-                    "pe":             round(pe, 1) if pe > 0 else None,
-                    "roe":            round(roe, 1),
-                    "roce":           round(roe * 0.9, 1),
-                    "netMargin":      round(margin, 1),
-                    "debtToEquity":   round(de, 2),
-                    "revenueGrowth5Y": round(rev_g, 1),
-                    "dividendYield":  round(div_y, 2),
-                    "sector":         sector,
-                    "yf_name":        name,
-                }
-                result[sym] = fund
-                _set_fund_cache(sym, fund)
-            except Exception:
-                continue
-    except ImportError:
-        print("[ROBU] yfinance not installed")
-    except Exception as e:
-        print(f"[ROBU] batch fundamentals error: {e}")
-    return result
+_QUERY_TS: dict = {}
+_QUERY_TTL = 3600              # 1 hour
 
 
 def _compute_score(roe, pe, de, margin):
-    score = 0
-    if roe >= 20:     score += 30
-    elif roe >= 15:   score += 20
-    elif roe >= 10:   score += 10
-    if 0 < pe <= 20:  score += 25
-    elif 0 < pe <= 35: score += 15
-    if de < 0.5:      score += 20
-    elif de < 1:      score += 10
-    if margin >= 15:  score += 25
-    elif margin >= 8: score += 15
-    return score
+    s = 0
+    if roe >= 20: s += 30
+    elif roe >= 15: s += 20
+    elif roe >= 10: s += 10
+    if 0 < pe <= 20: s += 25
+    elif 0 < pe <= 35: s += 15
+    if de < 0.5: s += 20
+    elif de < 1: s += 10
+    if margin >= 15: s += 25
+    elif margin >= 8: s += 15
+    return s
+
+
+def _yf_load_background():
+    """
+    Background thread: batch-fetch fundamentals for top NSE stocks via yfinance.
+    Writes to cache after each batch — screener goes live after first 100 stocks.
+    """
+    global _YF_CACHE, _YF_LOADED, _YF_LOADING, _YF_LAST_REFRESH
+    with _YF_LOCK:
+        if _YF_LOADING:
+            return
+        _YF_LOADING = True
+
+    try:
+        import yfinance as yf
+
+        # Deduplicate while preserving order
+        seen = set()
+        symbols = [s for s in _SCREENER_TOP if s not in seen and not seen.add(s)]
+        # Add remaining STOCK_UNIVERSE symbols after the priority list
+        for sym in STOCK_UNIVERSE:
+            if sym not in seen:
+                symbols.append(sym)
+                seen.add(sym)
+
+        print(f"[ROBU] screener: loading {len(symbols)} stocks in background...")
+        results = []
+        BATCH = 100
+
+        for i in range(0, len(symbols), BATCH):
+            batch = symbols[i:i+BATCH]
+            tickers_str = " ".join(f"{s}.NS" for s in batch)
+            try:
+                tobj = yf.Tickers(tickers_str)
+                for sym in batch:
+                    try:
+                        t = tobj.tickers.get(f"{sym}.NS")
+                        if not t: continue
+                        fi   = t.fast_info if hasattr(t, "fast_info") else None
+                        info = t.info      if hasattr(t, "info")      else {}
+                        price  = float(getattr(fi, "last_price", 0) or info.get("currentPrice") or info.get("regularMarketPrice") or 0)
+                        mktcap = float(getattr(fi, "market_cap", 0) or info.get("marketCap") or 0) / 1e7
+                        if price <= 0: continue
+                        pe     = float(info.get("trailingPE") or 0)
+                        roe    = float(info.get("returnOnEquity") or 0) * 100
+                        margin = float(info.get("profitMargins") or 0) * 100
+                        de_r   = float(info.get("debtToEquity") or 0)
+                        de     = de_r / 100 if de_r > 5 else de_r
+                        rev_g  = float(info.get("revenueGrowth") or 0) * 100
+                        div_y  = float(info.get("dividendYield") or 0) * 100
+                        sector = info.get("sector") or info.get("industry") or "NSE Listed"
+                        name   = info.get("longName") or info.get("shortName") or STOCK_UNIVERSE.get(sym, {}).get("name", sym)
+                        results.append({
+                            "symbol": sym, "name": name, "screenerSlug": sym,
+                            "sector": sector, "price": round(price,2),
+                            "marketCap": round(mktcap,1),
+                            "pe": round(pe,1) if pe > 0 else None,
+                            "roe": round(roe,1), "roce": round(roe*0.9,1),
+                            "netMargin": round(margin,1), "debtToEquity": round(de,2),
+                            "revenueGrowth5Y": round(rev_g,1), "patGrowth5Y": 0.0,
+                            "dividendYield": round(div_y,2), "promoterHolding": 0.0,
+                            "score": _compute_score(roe, pe, de, margin),
+                        })
+                    except Exception: continue
+            except Exception as e:
+                print(f"[ROBU] screener batch {i} err: {e}")
+
+            # Write partial results after every batch so screener works immediately
+            with _YF_LOCK:
+                _YF_CACHE = list(results)
+                if not _YF_LOADED and results:
+                    _YF_LOADED = True
+                    print(f"[ROBU] screener: first batch ready ({len(results)} stocks) ✓")
+
+            pct = min(100, int((i + BATCH) / len(symbols) * 100))
+            print(f"[ROBU] screener: {len(results)} loaded ({pct}%)...")
+            time.sleep(1)  # gentle on Yahoo Finance rate limits
+
+        with _YF_LOCK:
+            _YF_CACHE = results
+            _YF_LOADED = True
+            _YF_LAST_REFRESH = time.time()
+            _YF_LOADING = False
+        print(f"[ROBU] screener: DONE — {len(results)} stocks loaded ✓")
+
+    except ImportError:
+        print("[ROBU] screener: yfinance not available")
+        with _YF_LOCK: _YF_LOADING = False
+    except Exception as e:
+        print(f"[ROBU] screener error: {e}")
+        with _YF_LOCK: _YF_LOADING = False
+
+
+# Start background load on server startup
+_threading.Thread(target=_yf_load_background, daemon=True).start()
+
+
+def _ensure_fresh():
+    """Trigger refresh if cache is stale."""
+    if not _YF_LOADING and time.time() - _YF_LAST_REFRESH > _YF_TTL:
+        _threading.Thread(target=_yf_load_background, daemon=True).start()
 
 
 @app.get("/screener-v2")
@@ -2661,197 +2711,54 @@ def stock_screener_v2(
     order: str = "desc",
     limit: int = 60,
 ):
-    """
-    Two-tier Spotify-style screener:
-    Tier 1: Filter NSE Bhavcopy index (instant, no external calls)
-    Tier 2: Fetch fundamentals only for passing stocks (on-demand, cached per stock)
-    """
-    # ── Query cache key ───────────────────────────────────────────────────────
-    cache_key = _hashlib.md5(
+    _ensure_fresh()
+
+    if not _YF_LOADED:
+        total = len(STOCK_UNIVERSE) if STOCK_UNIVERSE else 2000
+        raise HTTPException(503, f"Loading stock data ({len(_YF_CACHE)}/{total}). Please wait ~60s and try again.")
+
+    # ── Query cache ──────────────────────────────────────────────────────────
+    qkey = _hashlib.md5(
         f"{min_roe}{max_pe}{min_net_margin}{max_debt_equity}{min_market_cap}"
         f"{max_market_cap}{min_rev_growth}{min_roce}{sector}{sort_by}{order}{limit}".encode()
     ).hexdigest()
-    if cache_key in _QUERY_CACHE and time.time() - _QUERY_CACHE_TS.get(cache_key, 0) < _QUERY_CACHE_TTL:
-        print(f"[ROBU] screener: serving from query cache ({len(_QUERY_CACHE[cache_key])} results)")
-        return _QUERY_CACHE[cache_key]
+    if qkey in _QUERY_CACHE and time.time() - _QUERY_TS.get(qkey, 0) < _QUERY_TTL:
+        return _QUERY_CACHE[qkey]
 
-    # ── Tier 1: filter by name/price/market cap from STOCK_UNIVERSE ───────────
-    # STOCK_UNIVERSE has ALL NSE stocks from Bhavcopy — instant filtering
-    # We use Bhavcopy prices for market cap filter, no external calls needed
-    bhav_prices = {}
-    for sym, info in STOCK_UNIVERSE.items():
-        bhav_prices[sym] = info
-
-    # When fundamentals filters are applied, we can't pre-filter by them yet
-    # So we narrow the candidate list first by market cap (Tier 1), then fetch fundamentals
-    needs_fundamentals = (
-        min_roe > 0 or max_pe < 9999 or min_net_margin > -999 or
-        max_debt_equity < 9999 or min_rev_growth > -999 or min_roce > 0
-    )
-
-    # Get market cap from Bhavcopy for Tier 1 filter
-    bhav = _cache_get("bhavcopy_all")  # our Bhavcopy cache
-    bhavcopy_prices: dict = {}
-    if bhav and isinstance(bhav, dict):
-        bhavcopy_prices = bhav
-
-    # Build candidate list — all NSE symbols, filtered by market cap if possible
-    candidates = list(STOCK_UNIVERSE.keys())
-
-    # If only market cap filter needed, we can answer from Bhavcopy alone
-    # For fundamental filters, narrow to top N by market cap then fetch
-    MAX_FUNDAMENTAL_FETCH = 400  # only fetch fundamentals for top 400 by mkt cap
-
-    if needs_fundamentals:
-        # Sort candidates by known market cap (from previous fetches or bhavcopy)
-        def _known_mktcap(sym):
-            cached = _get_fund_cached(sym)
-            if cached:
-                return cached.get("marketCap", 0)
-            # Estimate from Bhavcopy price × shares (rough)
-            return 0
-
-        # Prioritise: stocks we already have cached fundamentals for first
-        cached_syms  = [s for s in candidates if _get_fund_cached(s) is not None]
-        missing_syms = [s for s in candidates if _get_fund_cached(s) is None]
-
-        # Apply market cap pre-filter on missing (limit how many we fetch)
-        # Without market cap data for missing stocks, take known large caps first
-        _LARGE_CAPS = [
-            "RELIANCE","TCS","HDFCBANK","BHARTIARTL","ICICIBANK","INFOSYS","SBIN",
-            "HINDUNILVR","ITC","BAJFINANCE","LT","KOTAKBANK","HCLTECH","MARUTI",
-            "ASIANPAINT","AXISBANK","TITAN","SUNPHARMA","ULTRACEMCO","NESTLEIND",
-            "WIPRO","POWERGRID","NTPC","TATAMOTORS","TECHM","BAJAJFINSV","COALINDIA",
-            "HDFCLIFE","GRASIM","INDUSINDBK","DIVISLAB","CIPLA","ADANIPORTS",
-            "DRREDDY","SBILIFE","ONGC","EICHERMOT","BPCL","BRITANNIA","APOLLOHOSP",
-            "JSWSTEEL","TATACONSUM","HINDALCO","HEROMOTOCO","TATAPOWER","TATASTEEL",
-            "M&M","BAJAJ-AUTO","GODREJCP","PIDILITIND","SIEMENS","DABUR","ADANIENT",
-            "HAVELLS","MARICO","AMBUJACEM","BERGEPAINT","COLPAL","MUTHOOTFIN",
-            "PAGEIND","LUPIN","TORNTPHARM","BIOCON","ALKEM","AUROPHARMA","DRREDDY",
-            "IPCALAB","ABBOTINDIA","ZOMATO","PAYTM","NYKAA","IRCTC","INDIGO",
-            "DELHIVERY","NAUKRI","MPHASIS","LTTS","PERSISTENT","COFORGE",
-            "TATAELXSI","CHOLAFIN","BAJAJHLDNG","HDFCAMC","ICICIPRULIFE","SBICARDS",
-            "MANAPPURAM","RECLTD","PFC","IRFC","DLF","GODREJPROP","PRESTIGE",
-            "OBEROIRLTY","POLYCAB","ASTRAL","CROMPTON","DIXON","VOLTAS","BLUEST",
-            "IDFCFIRSTB","BANDHANBNK","AUBANK","YESBANK","FEDERALBNK","EQUITASBNK",
-        ]
-        large_set = set(_LARGE_CAPS)
-        priority_missing = [s for s in _LARGE_CAPS if s in set(missing_syms)]
-        other_missing    = [s for s in missing_syms if s not in large_set]
-
-        # Fetch fundamentals for: all cached + priority missing + some others
-        # Cap at MAX_FUNDAMENTAL_FETCH total
-        to_fetch = priority_missing[:MAX_FUNDAMENTAL_FETCH]
-        already_fetching = set(to_fetch)
-
-        if len(to_fetch) < MAX_FUNDAMENTAL_FETCH:
-            remaining = MAX_FUNDAMENTAL_FETCH - len(to_fetch)
-            to_fetch += [s for s in other_missing if s not in already_fetching][:remaining]
-
-        if to_fetch:
-            print(f"[ROBU] screener: fetching fundamentals for {len(to_fetch)} stocks...")
-            _fetch_fundamentals_batch(to_fetch)
-
-    # ── Tier 2: build results from cache ──────────────────────────────────────
-    results = []
-    for sym in candidates:
-        try:
-            universe_info = STOCK_UNIVERSE.get(sym, {})
-            fund = _get_fund_cached(sym)
-
-            # Use fundamentals if available, else basic data only
-            if fund:
-                price   = fund.get("price", 0)
-                mktcap  = fund.get("marketCap", 0)
-                pe      = fund.get("pe")
-                roe     = fund.get("roe", 0)
-                margin  = fund.get("netMargin", 0)
-                de      = fund.get("debtToEquity", 0)
-                rev_g   = fund.get("revenueGrowth5Y", 0)
-                roce    = fund.get("roce", 0)
-                div_y   = fund.get("dividendYield", 0)
-                stk_sector = fund.get("sector") or universe_info.get("sector", "NSE Listed")
-                name    = fund.get("yf_name") or universe_info.get("name", sym)
-            else:
-                # No fundamentals yet — basic data only, skip fundamental filters
-                if needs_fundamentals:
-                    continue
-                price   = 0
-                mktcap  = 0
-                pe      = None
-                roe     = 0
-                margin  = 0
-                de      = 0
-                rev_g   = 0
-                roce    = 0
-                div_y   = 0
-                stk_sector = universe_info.get("sector", "NSE Listed")
-                name    = universe_info.get("name", sym)
-
-            if price <= 0 and needs_fundamentals:
-                continue
-
-            # ── Apply filters ─────────────────────────────────────────────────
-            if roe < min_roe:                                          continue
-            if max_pe < 9999 and (not pe or pe > max_pe):             continue
-            if margin < min_net_margin:                                continue
-            if max_debt_equity < 9999 and de > max_debt_equity:       continue
-            if mktcap > 0 and mktcap < min_market_cap:                continue
-            if mktcap > 0 and mktcap > max_market_cap:                continue
-            if min_rev_growth > -999 and rev_g < min_rev_growth:      continue
-            if min_roce > 0 and roce < min_roce:                      continue
-            if sector and sector.lower() not in stk_sector.lower():   continue
-
-            results.append({
-                "symbol":          sym,
-                "name":            name,
-                "screenerSlug":    sym,
-                "sector":          stk_sector,
-                "price":           price,
-                "marketCap":       mktcap,
-                "pe":              pe,
-                "roe":             roe,
-                "roce":            roce,
-                "netMargin":       margin,
-                "debtToEquity":    de,
-                "revenueGrowth5Y": rev_g,
-                "patGrowth5Y":     0.0,
-                "dividendYield":   div_y,
-                "promoterHolding": 0.0,
-                "score":           _compute_score(roe, pe or 0, de, margin),
-            })
-        except Exception:
-            continue
+    # ── Filter ───────────────────────────────────────────────────────────────
+    filtered = []
+    for s in _YF_CACHE:
+        if s["roe"] < min_roe: continue
+        if max_pe < 9999 and (not s["pe"] or s["pe"] > max_pe): continue
+        if s["netMargin"] < min_net_margin: continue
+        if max_debt_equity < 9999 and s["debtToEquity"] > max_debt_equity: continue
+        if s["marketCap"] > 0 and s["marketCap"] < min_market_cap: continue
+        if s["marketCap"] > 0 and s["marketCap"] > max_market_cap: continue
+        if min_rev_growth > -999 and s["revenueGrowth5Y"] < min_rev_growth: continue
+        if min_roce > 0 and s["roce"] < min_roce: continue
+        if sector and sector.lower() not in (s.get("sector") or "").lower(): continue
+        filtered.append(s)
 
     # ── Sort ─────────────────────────────────────────────────────────────────
-    sort_key_map = {
-        "Market Capitalization": "marketCap", "marketCap": "marketCap",
-        "Return on equity": "roe",           "roe": "roe",
-        "Price to Earning": "pe",            "pe": "pe",
-        "Net profit margin": "netMargin",    "score": "score",
-        "Sales growth 5Years": "revenueGrowth5Y",
-        "Return on capital employed": "roce",
-    }
-    sk = sort_key_map.get(sort_by, "marketCap")
-    results.sort(key=lambda x: (x.get(sk) or 0), reverse=(order == "desc"))
-    final = results[:limit]
+    sk = {"Market Capitalization":"marketCap","Return on equity":"roe",
+          "Price to Earning":"pe","Net profit margin":"netMargin",
+          "Sales growth 5Years":"revenueGrowth5Y","Return on capital employed":"roce",
+          "marketCap":"marketCap","roe":"roe","pe":"pe","score":"score"}.get(sort_by,"marketCap")
+    filtered.sort(key=lambda x: (x.get(sk) or 0), reverse=(order=="desc"))
+    result = filtered[:limit]
 
-    # Cache this query result
-    _QUERY_CACHE[cache_key] = final
-    _QUERY_CACHE_TS[cache_key] = time.time()
-
-    print(f"[ROBU] screener: {len(final)} results (from {len(results)} matching, {len(candidates)} total universe)")
-    return final
+    _QUERY_CACHE[qkey] = result
+    _QUERY_TS[qkey] = time.time()
+    print(f"[ROBU] screener: returning {len(result)} results (from {len(filtered)} matching, {len(_YF_CACHE)} cached)")
+    return result
 
 
 @app.get("/screener-status")
 def screener_status():
-    """Check screener cache status."""
-    cached_count = sum(1 for ts in _FUND_CACHE_TS.values()
-                       if time.time() - ts < _FUND_CACHE_TTL)
+    total = len(STOCK_UNIVERSE) if STOCK_UNIVERSE else 2000
     return {
-        "fundamentals_cached": cached_count,
-        "query_cache_size":    len(_QUERY_CACHE),
-        "universe_size":       len(STOCK_UNIVERSE),
-        "architecture":        "two-tier: bhavcopy index + on-demand fundamentals",
+        "loaded": _YF_LOADED, "loading": _YF_LOADING,
+        "cached": len(_YF_CACHE), "total": total,
+        "pct": round(len(_YF_CACHE)/total*100, 1) if total else 0,
+        "query_cache": len(_QUERY_CACHE),
     }
