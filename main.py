@@ -300,7 +300,7 @@ def _parse_screener_ratios(soup: Any) -> dict:
                     ratios["roce"] = float(value)
                 elif "roe" in name and "roce" not in name:
                     ratios["roe"] = float(value)
-                elif "debt / equity" in name or "debt/equity" in name:
+                elif any(p in name for p in ("debt / equity", "debt/equity", "debt to equity", "d/e", "borrowing")):
                     ratios["debtToEquity"] = float(value)
                 elif any(p in name for p in ("high / low", "52 week", "52w h/l", "high/low", "wk h/l", "week h/l")):
                     # Screener formats: "3,480 / 1,278" or "₹3,480 / ₹1,278"
@@ -325,6 +325,21 @@ def _parse_screener_ratios(soup: Any) -> dict:
     bv    = ratios.get("bookValue", 0)
     if price > 0 and bv > 0:
         ratios["pb"] = round(price / bv, 2)
+
+    # Fallback: parse D/E from the detailed ratios table if not in top-ratios
+    if "debtToEquity" not in ratios and soup:
+        try:
+            for table in soup.find_all("table"):
+                for row in table.find_all("tr"):
+                    cells = row.find_all("td")
+                    if len(cells) >= 2:
+                        label_text = cells[0].get_text(strip=True).lower()
+                        if any(p in label_text for p in ("debt / equity", "debt/equity", "debt to equity")):
+                            val_text = cells[1].get_text(strip=True).replace(",","").replace("₹","").strip()
+                            ratios["debtToEquity"] = float(val_text)
+                            break
+        except Exception:
+            pass
 
     # ── Industry from Screener's breadcrumb / tags (more precise than Yahoo) ─
     # Screener shows the industry category in breadcrumb or tag links.
