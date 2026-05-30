@@ -500,9 +500,9 @@ def _parse_screener_financials(soup: Any) -> list:
             "source":        "screener",
         })
 
-    # Keep last 5 full years (drop older ones)
+    # Keep last 10 full years (Screener.in provides up to 10 years)
     annual = [r for r in result if not r["year"].startswith("TTM")]
-    return annual[-5:]
+    return annual[-10:]
 
 app = FastAPI(title="ROBU Data Server", version="2.0.0")
 
@@ -1297,7 +1297,7 @@ def financials(symbol: str):
                 "revenueGrowth": ttm_rev_growth,
                 "ebitdaMargin": ttm_ebitda_margin,
             })
-            rows = rows[-5:]  # keep only 5 years
+            rows = rows[-10:]  # keep up to 10 years
 
     _cache_set(cache_key, rows)
     return rows
@@ -2780,3 +2780,52 @@ def screener_status():
     return {"cached_stocks": count, "seed_stocks": len(_SEED),
             "api_key_set": bool(TWELVE_DATA_KEY), "refreshing": _REFRESHING,
             "last_refresh_hours": round((time.time()-_LAST_REFRESH)/3600,1) if _LAST_REFRESH else None}
+
+
+# ---------------------------------------------------------------------------
+# NSE Announcements — free public data from NSE India
+# ---------------------------------------------------------------------------
+@app.get("/announcements/{symbol}")
+def get_announcements(symbol: str, limit: int = 10):
+    """
+    Fetch recent corporate announcements for a stock from NSE India.
+    Uses NSE's public corporate filing endpoint — no auth needed.
+    """
+    symbol = symbol.upper().strip()
+    cache_key = f"announcements:{symbol}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    headers = _make_browser_headers("https://www.nseindia.com/")
+    headers["Referer"] = "https://www.nseindia.com/companies-listing/corporate-filings-announcements"
+
+    try:
+        # NSE public announcements API
+        url = f"https://www.nseindia.com/api/corp-info?symbol={symbol}&subject=Corp%20Announcement"
+        resp = requests.get(url, headers=headers, timeout=12)
+        if not resp.ok:
+            # Try alternate endpoint
+            url2 = f"https://www.nseindia.com/api/corporates-announcements?index=equities&symbol={symbol}&issuer=&from_date=&to_date="
+            resp = requests.get(url2, headers=headers, timeout=12)
+
+        if resp.ok:
+            data = resp.json()
+            # NSE returns different shapes — normalize
+            items = []
+            raw = data if isinstance(data, list) else data.get("data", data.get("announcements", []))
+            for item in raw[:limit]:
+                items.append({
+                    "date":     item.get("an_dt") or item.get("exchdisstime") or item.get("date", ""),
+                    "subject":  item.get("subject") or item.get("desc") or item.get("subject", "Corporate Announcement"),
+                    "category": item.get("sm_name") or item.get("attchmntText") or item.get("category", ""),
+                    "url":      f"https://www.nseindia.com/companypage/{symbol}-announcements",
+                })
+            result = {"symbol": symbol, "announcements": items, "source": "nse"}
+            _cache_set(cache_key, result)
+            return result
+    except Exception as e:
+        print(f"[NSE announcements] {symbol}: {e}")
+
+    # Fallback — return empty so frontend handles gracefully
+    return {"symbol": symbol, "announcements": [], "source": "nse", "error": "unavailable"}
