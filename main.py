@@ -2670,17 +2670,23 @@ def _fetch_twelve_data():
                     d = r.json()
                     if d.get("status") == "error": continue
 
-                    vs = d.get("valuations", {})
-                    fs = d.get("financials", {})
-                    ss = d.get("statistics", {})
+                    # Correct Twelve Data /statistics response structure:
+                    # d["statistics"]["valuations_metrics"], ["financials"], ["stock_statistics"]
+                    # Values are plain strings/numbers — NOT {"value": ...} objects
+                    stats = d.get("statistics", {})
+                    vs = stats.get("valuations_metrics", {})
+                    fs = stats.get("financials", {})
+                    ss = stats.get("stock_statistics", {})
 
-                    pe     = float(vs.get("trailing_pe",{}).get("value") or vs.get("forward_pe",{}).get("value") or 0) or None
-                    mktcap = float(ss.get("market_cap",{}).get("value") or 0) / 1e7  # → ₹ Crore (approx)
-                    roe    = float(fs.get("return_on_equity_ttm",{}).get("value") or 0) * 100
-                    margin = float(fs.get("profit_margin",{}).get("value") or 0) * 100
-                    de     = float(fs.get("total_debt_to_equity_mrq",{}).get("value") or 0)
-                    rev_g  = float(fs.get("quarterly_revenue_growth_yoy",{}).get("value") or 0) * 100
-                    div_y  = float(fs.get("dividend_yield",{}).get("value") or 0) * 100
+                    def _f(v): return float(v) if v not in (None, "", "N/A", "-") else 0.0
+
+                    pe     = _f(vs.get("trailing_pe") or vs.get("forward_pe")) or None
+                    mktcap = _f(ss.get("market_capitalization", 0)) / 1e7  # → ₹ Crore
+                    roe    = _f(fs.get("return_on_equity_ttm")) * 100
+                    margin = _f(fs.get("profit_margin")) * 100
+                    de     = _f(fs.get("total_debt_to_equity_mrq"))
+                    rev_g  = _f(fs.get("quarterly_revenue_growth_yoy")) * 100
+                    div_y  = _f(ss.get("forward_annual_dividend_yield")) * 100
 
                     # Get current price from quote endpoint (1 credit)
                     qr = requests.get(f"{base}/price", params={"symbol":td_sym,"apikey":TWELVE_DATA_KEY}, timeout=8)
