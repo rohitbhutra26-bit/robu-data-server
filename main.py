@@ -1756,6 +1756,95 @@ def historical_valuation(symbol: str):
 
 
 # ---------------------------------------------------------------------------
+# Daily OHLC candles — powers the TradingView Lightweight price chart
+# ---------------------------------------------------------------------------
+def _yf_chart(symbol_ns: str, rng: str = "2y", interval: str = "1d") -> dict:
+    """Call the Yahoo Finance chart API directly (daily OHLC time-series)."""
+    _ensure_yahoo()
+    if not _YF_SESSION_OBJ:
+        raise HTTPException(503, "Yahoo Finance session unavailable on this server")
+
+    params = {"range": rng, "interval": interval}
+    resp = _YF_SESSION_OBJ.get(
+        f"{_YF_HOST}/v8/finance/chart/{symbol_ns}", params=params, timeout=20
+    )
+
+    # Refresh session once if expired
+    if resp.status_code in (401, 403):
+        global _YF_SESSION_TS
+        _YF_SESSION_TS = 0
+        _init_yahoo()
+        if not _YF_SESSION_OBJ:
+            raise HTTPException(503, "Yahoo Finance session refresh failed")
+        resp = _YF_SESSION_OBJ.get(
+            f"{_YF_HOST}/v8/finance/chart/{symbol_ns}", params=params, timeout=20
+        )
+
+    if not resp.ok:
+        raise HTTPException(resp.status_code, f"Yahoo chart error for {symbol_ns}: HTTP {resp.status_code}")
+
+    data = resp.json()
+    err = (data.get("chart") or {}).get("error")
+    if err:
+        raise HTTPException(404, (err or {}).get("description", "Not found"))
+    results = (data.get("chart") or {}).get("result") or []
+    if not results:
+        raise HTTPException(404, f"No chart data for {symbol_ns}")
+    return results[0]
+
+
+@app.get("/ohlc/{symbol}")
+def ohlc(symbol: str, period: str = "2y"):
+    """
+    Daily OHLC candles for the price chart.
+    Tries the resolved exchange first, then falls back to the other suffix.
+    """
+    symbol = symbol.upper().strip()
+    cache_key = f"ohlc:{symbol}:{period}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    ticker, _ = _resolve_ticker(symbol)
+    try:
+        res = _yf_chart(ticker, rng=period)
+    except HTTPException:
+        alt = ticker.replace(".NS", ".BO") if ticker.endswith(".NS") else ticker.replace(".BO", ".NS")
+        res = _yf_chart(alt, rng=period)
+
+    timestamps = res.get("timestamp") or []
+    quote = (((res.get("indicators") or {}).get("quote") or [{}])[0]) or {}
+    opens  = quote.get("open")  or []
+    highs  = quote.get("high")  or []
+    lows   = quote.get("low")   or []
+    closes = quote.get("close") or []
+
+    candles = []
+    for i, ts in enumerate(timestamps):
+        o = opens[i]  if i < len(opens)  else None
+        h = highs[i]  if i < len(highs)  else None
+        l = lows[i]   if i < len(lows)   else None
+        c = closes[i] if i < len(closes) else None
+        if o is None or h is None or l is None or c is None:
+            continue
+        candles.append({
+            "time":  time.strftime("%Y-%m-%d", time.gmtime(ts)),
+            "open":  round(float(o), 2),
+            "high":  round(float(h), 2),
+            "low":   round(float(l), 2),
+            "close": round(float(c), 2),
+        })
+
+    if not candles:
+        raise HTTPException(404, f"No OHLC data for {symbol}")
+
+    result = {"symbol": symbol, "candles": candles, "source": "yahoo"}
+    _cache_set(cache_key, result)
+    print(f"[ohlc] {symbol}: {len(candles)} candles ✓")
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Sector peer map — curated Indian stocks by sector
 # ---------------------------------------------------------------------------
 _SECTOR_PEERS: dict[str, list[str]] = {
