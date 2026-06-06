@@ -1,3 +1,6 @@
 nse_equity_list.json
 __pycache__
 *.pyc
+*.log
+.data.log
+.web.log
