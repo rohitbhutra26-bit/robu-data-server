@@ -45,7 +45,9 @@ DPID=$!
 
 say "Starting the app (port 3000)..."
 cd "$WEB"
-[ -d node_modules ] || npm install
+# Always install (fast when nothing changed) so new dependencies pulled from
+# git are picked up automatically on either laptop.
+npm install --no-audit --no-fund --silent
 ( NODE_OPTIONS=--max-old-space-size=2048 npm run dev ) >"$HERE/.web.log" 2>&1 &
 WPID=$!
 

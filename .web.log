@@ -65,3 +65,31 @@ Read more: https://nextjs.org/docs/app/api-reference/functions/generate-viewport
  ⚠ Unsupported metadata themeColor is configured in metadata export in /valuation. Please move it to viewport export instead.
 Read more: https://nextjs.org/docs/app/api-reference/functions/generate-viewport
  GET /valuation?symbol=ANGELONE 404 in 47ms
+ ✓ Compiled in 1212ms (4522 modules)
+ ⚠ Unsupported metadata viewport is configured in metadata export in /valuation. Please move it to viewport export instead.
+Read more: https://nextjs.org/docs/app/api-reference/functions/generate-viewport
+ ⚠ Unsupported metadata themeColor is configured in metadata export in /valuation. Please move it to viewport export instead.
+Read more: https://nextjs.org/docs/app/api-reference/functions/generate-viewport
+ ⚠ Unsupported metadata viewport is configured in metadata export in /. Please move it to viewport export instead.
+Read more: https://nextjs.org/docs/app/api-reference/functions/generate-viewport
+ ⚠ Unsupported metadata themeColor is configured in metadata export in /. Please move it to viewport export instead.
+Read more: https://nextjs.org/docs/app/api-reference/functions/generate-viewport
+ ⚠ Unsupported metadata viewport is configured in metadata export in /valuation. Please move it to viewport export instead.
+Read more: https://nextjs.org/docs/app/api-reference/functions/generate-viewport
+ ⚠ Unsupported metadata themeColor is configured in metadata export in /valuation. Please move it to viewport export instead.
+Read more: https://nextjs.org/docs/app/api-reference/functions/generate-viewport
+ GET /valuation?symbol=ANGELONE 404 in 82ms
+ ⨯ ./src/components/PriceChart.tsx:4:1
+Module not found: Can't resolve 'lightweight-charts'
+[0m [90m 2 |[39m[0m
+[0m [90m 3 |[39m [36mimport[39m { useEffect[33m,[39m useRef[33m,[39m useState[33m,[39m useMemo } [36mfrom[39m [32m'react'[39m[33m;[39m[0m
+[0m[31m[1m>[22m[39m[90m 4 |[39m [36mimport[39m {[0m
+[0m [90m   |[39m [31m[1m^[22m[39m[0m
+[0m [90m 5 |[39m   createChart[33m,[39m[0m
+[0m [90m 6 |[39m   [33mColorType[39m[33m,[39m[0m
+[0m [90m 7 |[39m   [33mLineStyle[39m[33m,[39m[0m
+
+https://nextjs.org/docs/messages/module-not-found
+
+Import trace for requested module:
+./src/app/page.tsx
