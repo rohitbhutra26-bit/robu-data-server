@@ -1,5 +1,27 @@
-INFO:     Started server process [47068]
+INFO:     Started server process [47534]
 INFO:     Waiting for application startup.
 INFO:     Application startup complete.
 INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
-INFO:     Shutting down
+[ROBU] Loaded 2373 stocks from local cache.
+[ROBU] BSE list HTTP 404 — skipping BSE universe
+[ROBU] screener: No TWELVE_DATA_API_KEY — serving 50 seed stocks. Add key to Railway env vars for live data.
+[Screener] RELIANCE→RELIANCE: public consolidated page loaded ✓
+[Screener] RELIANCE→RELIANCE: public consolidated page loaded ✓
+[Screener] RELIANCE: 10 years from Screener.in ✓
+INFO:     127.0.0.1:56088 - "GET /financials-v2/RELIANCE HTTP/1.1" 200 OK
+[Bhavcopy] Loaded 3016 stocks from NSE (05062026)
+[company-v2] RELIANCE: price=1291.0 (bhavcopy), PE=22.4, ROE=8.91 ✓
+INFO:     127.0.0.1:56089 - "GET /company-v2/RELIANCE HTTP/1.1" 200 OK
+[Screener] RELIANCE→RELIANCE: public consolidated page loaded ✓
+[historical] RELIANCE: Screener company_id=2726
+[Screener] RELIANCE→RELIANCE: public consolidated page loaded ✓
+[historical] RELIANCE: Screener company_id=2726
+[Screener chart] HTTP 404 for Price-to-Earning (id=2726)
+[Screener chart] HTTP 404 for Price-to-Earning (id=2726)
+[Screener chart] HTTP 404 for Price-to-Book (id=2726)
+[Screener chart] HTTP 404 for Price-to-Book (id=2726)
+INFO:     127.0.0.1:56088 - "GET /historical/RELIANCE HTTP/1.1" 404 Not Found
+INFO:     127.0.0.1:56105 - "GET /historical/RELIANCE HTTP/1.1" 404 Not Found
+[ROBU] Yahoo Finance session ready (attempt 1)
+[ohlc] RELIANCE: 498 candles ✓
+INFO:     127.0.0.1:56089 - "GET /ohlc/RELIANCE?period=2y HTTP/1.1" 200 OK

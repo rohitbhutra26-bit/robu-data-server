@@ -6,90 +6,23 @@
   - Local:        http://localhost:3000
 
  ✓ Starting...
- ✓ Ready in 1195ms
+ ✓ Ready in 1431ms
  ○ Compiling / ...
- ✓ Compiled / in 4.6s (4519 modules)
+ ✓ Compiled / in 4.8s (4533 modules)
  ⚠ Unsupported metadata viewport is configured in metadata export in /. Please move it to viewport export instead.
 Read more: https://nextjs.org/docs/app/api-reference/functions/generate-viewport
  ⚠ Unsupported metadata themeColor is configured in metadata export in /. Please move it to viewport export instead.
 Read more: https://nextjs.org/docs/app/api-reference/functions/generate-viewport
- GET / 200 in 5012ms
- ✓ Compiled in 432ms (2268 modules)
- ○ Compiling /_not-found ...
- ✓ Compiled /_not-found in 767ms (4508 modules)
- ⚠ Unsupported metadata viewport is configured in metadata export in /automated. Please move it to viewport export instead.
-Read more: https://nextjs.org/docs/app/api-reference/functions/generate-viewport
- ⚠ Unsupported metadata themeColor is configured in metadata export in /automated. Please move it to viewport export instead.
-Read more: https://nextjs.org/docs/app/api-reference/functions/generate-viewport
- GET /automated 404 in 47ms
- ⚠ Unsupported metadata viewport is configured in metadata export in /valuation. Please move it to viewport export instead.
-Read more: https://nextjs.org/docs/app/api-reference/functions/generate-viewport
- ⚠ Unsupported metadata themeColor is configured in metadata export in /valuation. Please move it to viewport export instead.
-Read more: https://nextjs.org/docs/app/api-reference/functions/generate-viewport
- GET /valuation?symbol=ANGELONE 404 in 32ms
- ○ Compiling /_not-found ...
- ⚠ Unsupported metadata viewport is configured in metadata export in /. Please move it to viewport export instead.
-Read more: https://nextjs.org/docs/app/api-reference/functions/generate-viewport
- ⚠ Unsupported metadata themeColor is configured in metadata export in /. Please move it to viewport export instead.
-Read more: https://nextjs.org/docs/app/api-reference/functions/generate-viewport
- ✓ Compiled /_not-found in 1071ms (4508 modules)
- ⚠ Unsupported metadata viewport is configured in metadata export in /valuation. Please move it to viewport export instead.
-Read more: https://nextjs.org/docs/app/api-reference/functions/generate-viewport
- ⚠ Unsupported metadata themeColor is configured in metadata export in /valuation. Please move it to viewport export instead.
-Read more: https://nextjs.org/docs/app/api-reference/functions/generate-viewport
- ⚠ Unsupported metadata viewport is configured in metadata export in /. Please move it to viewport export instead.
-Read more: https://nextjs.org/docs/app/api-reference/functions/generate-viewport
- ⚠ Unsupported metadata themeColor is configured in metadata export in /. Please move it to viewport export instead.
-Read more: https://nextjs.org/docs/app/api-reference/functions/generate-viewport
- ⚠ Unsupported metadata viewport is configured in metadata export in /valuation. Please move it to viewport export instead.
-Read more: https://nextjs.org/docs/app/api-reference/functions/generate-viewport
- ⚠ Unsupported metadata themeColor is configured in metadata export in /valuation. Please move it to viewport export instead.
-Read more: https://nextjs.org/docs/app/api-reference/functions/generate-viewport
- ⚠ Unsupported metadata viewport is configured in metadata export in /valuation. Please move it to viewport export instead.
-Read more: https://nextjs.org/docs/app/api-reference/functions/generate-viewport
- ⚠ Unsupported metadata themeColor is configured in metadata export in /valuation. Please move it to viewport export instead.
-Read more: https://nextjs.org/docs/app/api-reference/functions/generate-viewport
- GET /valuation?symbol=ANGELONE 404 in 63ms
- ✓ Compiled in 414ms (2268 modules)
- ⚠ Unsupported metadata viewport is configured in metadata export in /. Please move it to viewport export instead.
-Read more: https://nextjs.org/docs/app/api-reference/functions/generate-viewport
- ⚠ Unsupported metadata themeColor is configured in metadata export in /. Please move it to viewport export instead.
-Read more: https://nextjs.org/docs/app/api-reference/functions/generate-viewport
- ✓ Compiled /_not-found in 477ms (4508 modules)
- ⚠ Unsupported metadata viewport is configured in metadata export in /valuation. Please move it to viewport export instead.
-Read more: https://nextjs.org/docs/app/api-reference/functions/generate-viewport
- ⚠ Unsupported metadata themeColor is configured in metadata export in /valuation. Please move it to viewport export instead.
-Read more: https://nextjs.org/docs/app/api-reference/functions/generate-viewport
- ⚠ Unsupported metadata viewport is configured in metadata export in /valuation. Please move it to viewport export instead.
-Read more: https://nextjs.org/docs/app/api-reference/functions/generate-viewport
- ⚠ Unsupported metadata themeColor is configured in metadata export in /valuation. Please move it to viewport export instead.
-Read more: https://nextjs.org/docs/app/api-reference/functions/generate-viewport
- GET /valuation?symbol=ANGELONE 404 in 47ms
- ✓ Compiled in 1212ms (4522 modules)
- ⚠ Unsupported metadata viewport is configured in metadata export in /valuation. Please move it to viewport export instead.
-Read more: https://nextjs.org/docs/app/api-reference/functions/generate-viewport
- ⚠ Unsupported metadata themeColor is configured in metadata export in /valuation. Please move it to viewport export instead.
-Read more: https://nextjs.org/docs/app/api-reference/functions/generate-viewport
- ⚠ Unsupported metadata viewport is configured in metadata export in /. Please move it to viewport export instead.
-Read more: https://nextjs.org/docs/app/api-reference/functions/generate-viewport
- ⚠ Unsupported metadata themeColor is configured in metadata export in /. Please move it to viewport export instead.
-Read more: https://nextjs.org/docs/app/api-reference/functions/generate-viewport
- ⚠ Unsupported metadata viewport is configured in metadata export in /valuation. Please move it to viewport export instead.
-Read more: https://nextjs.org/docs/app/api-reference/functions/generate-viewport
- ⚠ Unsupported metadata themeColor is configured in metadata export in /valuation. Please move it to viewport export instead.
-Read more: https://nextjs.org/docs/app/api-reference/functions/generate-viewport
- GET /valuation?symbol=ANGELONE 404 in 82ms
- ⨯ ./src/components/PriceChart.tsx:4:1
-Module not found: Can't resolve 'lightweight-charts'
-[0m [90m 2 |[39m[0m
-[0m [90m 3 |[39m [36mimport[39m { useEffect[33m,[39m useRef[33m,[39m useState[33m,[39m useMemo } [36mfrom[39m [32m'react'[39m[33m;[39m[0m
-[0m[31m[1m>[22m[39m[90m 4 |[39m [36mimport[39m {[0m
-[0m [90m   |[39m [31m[1m^[22m[39m[0m
-[0m [90m 5 |[39m   createChart[33m,[39m[0m
-[0m [90m 6 |[39m   [33mColorType[39m[33m,[39m[0m
-[0m [90m 7 |[39m   [33mLineStyle[39m[33m,[39m[0m
-
-https://nextjs.org/docs/messages/module-not-found
-
-Import trace for requested module:
-./src/app/page.tsx
+ GET / 200 in 5184ms
+ ✓ Compiled in 442ms (2275 modules)
+ ✓ Compiled /api/financials-v2/[symbol] in 404ms (2288 modules)
+ ✓ Compiled (2290 modules)
+ GET /api/financials-v2/RELIANCE 200 in 1076ms
+ GET /api/company-v2/RELIANCE 200 in 1466ms
+ ✓ Compiled /api/ohlc/[symbol] in 148ms (2293 modules)
+ ✓ Compiled (2297 modules)
+ POST /api/ai-analysis 503 in 304ms
+ POST /api/ai-analysis 503 in 312ms
+ GET /api/historical/RELIANCE 404 in 1069ms
+ GET /api/historical/RELIANCE 404 in 1087ms
+ GET /api/ohlc/RELIANCE?period=2y 200 in 3585ms
