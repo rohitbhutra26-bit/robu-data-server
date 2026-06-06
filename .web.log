@@ -15,3 +15,15 @@ Read more: https://nextjs.org/docs/app/api-reference/functions/generate-viewport
 Read more: https://nextjs.org/docs/app/api-reference/functions/generate-viewport
  GET / 200 in 5012ms
  ✓ Compiled in 432ms (2268 modules)
+ ○ Compiling /_not-found ...
+ ✓ Compiled /_not-found in 767ms (4508 modules)
+ ⚠ Unsupported metadata viewport is configured in metadata export in /automated. Please move it to viewport export instead.
+Read more: https://nextjs.org/docs/app/api-reference/functions/generate-viewport
+ ⚠ Unsupported metadata themeColor is configured in metadata export in /automated. Please move it to viewport export instead.
+Read more: https://nextjs.org/docs/app/api-reference/functions/generate-viewport
+ GET /automated 404 in 47ms
+ ⚠ Unsupported metadata viewport is configured in metadata export in /valuation. Please move it to viewport export instead.
+Read more: https://nextjs.org/docs/app/api-reference/functions/generate-viewport
+ ⚠ Unsupported metadata themeColor is configured in metadata export in /valuation. Please move it to viewport export instead.
+Read more: https://nextjs.org/docs/app/api-reference/functions/generate-viewport
+ GET /valuation?symbol=ANGELONE 404 in 32ms
