@@ -1341,7 +1341,44 @@ def company_v2(symbol: str):
     # ── 1. Screener.in — all fundamentals ────────────────────────────────────
     soup = _fetch_screener_page(symbol)
     if not soup:
-        raise HTTPException(404, f"Company {symbol} not found on Screener.in")
+        # Screener.in doesn't have this company (e.g. TATAMOTORS returns 404 on Screener).
+        # Fallback chain: Yahoo Finance → NSE Bhavcopy + universe static data.
+        print(f"[company-v2] Screener returned None for {symbol} — trying Yahoo Finance fallback")
+        try:
+            return company(symbol)   # v1 Yahoo Finance path (handles its own caching)
+        except Exception as yf_err:
+            print(f"[company-v2] Yahoo also failed for {symbol}: {yf_err}")
+            # Last resort: return price from Bhavcopy + static metadata from STOCK_UNIVERSE.
+            # Ratio fields (PE, ROE, etc.) will be 0 — frontend degrades gracefully.
+            bhav = _bhavcopy_price(symbol)
+            if not bhav or bhav.get("close", 0) == 0:
+                raise HTTPException(404, f"No data for {symbol}: Screener not indexed, Yahoo: {yf_err}")
+            p  = bhav["close"]
+            pc = bhav.get("prevClose", 0)
+            chg     = round(p - pc, 2) if pc else 0.0
+            chg_pct = round((chg / pc) * 100, 2) if pc else 0.0
+            result = {
+                "symbol":        symbol,
+                "name":          stock_meta.get("name", symbol),
+                "sector":        stock_meta.get("sector", "Unknown"),
+                "industry":      "",
+                "exchange":      stock_meta.get("exchange", "NSE"),
+                "currentPrice":  p,
+                "previousClose": pc,
+                "change":        chg,
+                "changePct":     chg_pct,
+                "marketCap":     0.0,
+                "pe":            0.0, "forwardPE": 0.0, "pb": 0.0,
+                "roe":           0.0, "roa":       0.0, "roce": 0.0,
+                "eps":           0.0, "dividendYield": 0.0,
+                "week52High":    0.0, "week52Low": 0.0,
+                "debtToEquity":  0.0, "bookValue": 0.0,
+                "currentRatio":  0.0, "shares":    0.0,
+                "beta":          0.0, "revenueGrowth": 0.0, "earningsGrowth": 0.0,
+                "dataSource":    "bhavcopy+universe",
+            }
+            _cache_set(cache_key, result)
+            return result
 
     ratios = _parse_screener_ratios(soup)
 
@@ -1476,8 +1513,15 @@ def financials_v2(symbol: str):
         print(f"[Screener] {symbol}: {len(screener_data)} years from Screener.in ✓")
         return screener_data
 
-    # ── Fallback: return empty with error rather than Yahoo ──────────────────
-    raise HTTPException(404, f"Screener.in data unavailable for {symbol}. Ensure SCREENER_USERNAME/SCREENER_PASSWORD are set.")
+    # ── Fallback: Yahoo Finance income statements ────────────────────────────
+    # Screener.in doesn't have this company — try Yahoo Finance (v1 path).
+    # If Yahoo also fails, return [] so the frontend loads without crashing.
+    print(f"[financials-v2] Screener failed for {symbol} — trying Yahoo Finance fallback")
+    try:
+        return financials(symbol)
+    except Exception as yf_err:
+        print(f"[financials-v2] Yahoo also failed for {symbol}: {yf_err} — returning empty financials")
+        return []   # Empty list: company page loads but valuation charts are blank
 
 
 @app.get("/price/{symbol}")
@@ -2933,3 +2977,4 @@ def get_announcements(symbol: str, limit: int = 10):
 
     # Fallback — return empty so frontend handles gracefully
     return {"symbol": symbol, "announcements": [], "source": "nse", "error": "unavailable"}
+
