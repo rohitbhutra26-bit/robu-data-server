@@ -1077,7 +1077,7 @@ def search(q: str = ""):
     q = q.strip()
     if not q:
         top = ["RELIANCE", "TCS", "INFY", "HDFCBANK", "ICICIBANK",
-               "WIPRO", "BAJFINANCE", "ITC", "SBIN", "TATAMOTORS"]
+               "WIPRO", "BAJFINANCE", "ITC", "SBIN", "TMPV", "TMCV"]
         return [_search_row(sym, STOCK_UNIVERSE[sym]) for sym in top if sym in STOCK_UNIVERSE]
 
     q_lower = q.lower()
@@ -1916,14 +1916,14 @@ _SECTOR_PEERS: dict[str, list[str]] = {
     "Consumer": ["TITAN.NS","TRENT.NS","NYKAA.NS","DMART.NS","BATA.NS","RELAXO.NS","VMART.NS"],
     "Pharmaceuticals": ["SUNPHARMA.NS","DIVISLAB.NS","CIPLA.NS","DRREDDY.NS","AUROPHARMA.NS","TORNTPHARM.NS","ALKEM.NS","LALPATHLAB.NS"],
     "Healthcare": ["SUNPHARMA.NS","DIVISLAB.NS","CIPLA.NS","DRREDDY.NS","AUROPHARMA.NS","TORNTPHARM.NS","ALKEM.NS"],
-    "Automobiles": ["TATAMOTORS.NS","MARUTI.NS","BAJAJ-AUTO.NS","EICHERMOT.NS","HEROMOTOCO.NS","MOTHERSON.NS","TVSMOTOR.NS","ASHOKLEY.NS"],
+    "Automobiles": ["TMPV.NS","MARUTI.NS","BAJAJ-AUTO.NS","EICHERMOT.NS","HEROMOTOCO.NS","MOTHERSON.NS","TVSMOTOR.NS","ASHOKLEY.NS"],
     "Energy": ["RELIANCE.NS","ONGC.NS","BPCL.NS","IOC.NS","GAIL.NS","PETRONET.NS","MGL.NS"],
     "Metals": ["TATASTEEL.NS","JSWSTEEL.NS","HINDALCO.NS","COALINDIA.NS","VEDL.NS","NMDC.NS","SAIL.NS","JINDALSTEL.NS"],
     "Infrastructure": ["LT.NS","SIEMENS.NS","ABB.NS","HAVELLS.NS","BHARTIARTL.NS","ADANIPORTS.NS","IRCTC.NS"],
     "Utilities": ["NTPC.NS","POWERGRID.NS","TATAPOWER.NS","TORNTPOWER.NS","ADANIGREEN.NS","CESC.NS"],
     "Telecom": ["BHARTIARTL.NS","IDEA.NS","TATACOMM.NS","HFCL.NS"],
     "Electronics": ["KAYNES.NS","DIXON.NS","AMBER.NS","SYRMA.NS","BEL.NS"],
-    "Conglomerate": ["RELIANCE.NS","ADANIENT.NS","ITC.NS","LT.NS","TATAMOTORS.NS","M&M.NS"],
+    "Conglomerate": ["RELIANCE.NS","ADANIENT.NS","ITC.NS","LT.NS","TMPV.NS","M&M.NS"],
     "Real Estate": ["DLF.NS","GODREJPROP.NS","PRESTIGE.NS","PHOENIXLTD.NS","OBEROI.NS","BRIGADE.NS"],
 }
 
@@ -1973,7 +1973,7 @@ _INDUSTRY_PEERS: dict[str, list[str]] = {
     "Diagnostics & Research": ["LALPATHLAB.NS","METROPOLIS.NS","THYROCARE.NS","KRSNAA.NS"],
 
     # ── Auto sub-types ────────────────────────────────────────────────────
-    "Auto Manufacturers":     ["TATAMOTORS.NS","MARUTI.NS","M&M.NS","BAJAJ-AUTO.NS","EICHERMOT.NS","HEROMOTOCO.NS","TVSMOTOR.NS"],
+    "Auto Manufacturers":     ["TMPV.NS","MARUTI.NS","M&M.NS","BAJAJ-AUTO.NS","EICHERMOT.NS","HEROMOTOCO.NS","TVSMOTOR.NS"],
     "Auto Parts":             ["MOTHERSON.NS","BOSCHLTD.NS","BHARATFORG.NS","APOLLOTYRE.NS","MRF.NS","BALKRISIND.NS"],
 
     # ── Oil & Gas ─────────────────────────────────────────────────────────
@@ -2724,7 +2724,7 @@ _SEED = [
     {"symbol":"SUNPHARMA", "name":"Sun Pharmaceutical",        "sector":"Healthcare",         "price":1920, "marketCap":461000, "pe":38.4,"roe":14.8,"roce":16.2,"netMargin":19.2,"debtToEquity":0.08,"revenueGrowth5Y":9.8, "dividendYield":0.9},
     {"symbol":"WIPRO",     "name":"Wipro",                     "sector":"Technology",         "price":570,  "marketCap":298000, "pe":24.2,"roe":16.8,"roce":21.4,"netMargin":14.4,"debtToEquity":0.15,"revenueGrowth5Y":7.8, "dividendYield":0.2},
     {"symbol":"NTPC",      "name":"NTPC",                      "sector":"Power",              "price":380,  "marketCap":369000, "pe":18.4,"roe":12.8,"roce":10.4,"netMargin":18.2,"debtToEquity":1.2, "revenueGrowth5Y":8.4, "dividendYield":2.1},
-    {"symbol":"TATAMOTORS","name":"Tata Motors",               "sector":"Automobile",         "price":1020, "marketCap":377000, "pe":10.2,"roe":31.4,"roce":18.8,"netMargin":5.8, "debtToEquity":1.4, "revenueGrowth5Y":18.4,"dividendYield":0.5},
+    {"symbol":"TMPV","name":"Tata Motors PV",                  "sector":"Automobile",         "price":398,  "marketCap":143000, "pe":10.2,"roe":31.4,"roce":18.8,"netMargin":5.8, "debtToEquity":1.4, "revenueGrowth5Y":18.4,"dividendYield":0.5},
     {"symbol":"TECHM",     "name":"Tech Mahindra",             "sector":"Technology",         "price":1720, "marketCap":167000, "pe":38.2,"roe":14.8,"roce":18.2,"netMargin":8.4, "debtToEquity":0.08,"revenueGrowth5Y":8.8, "dividendYield":1.4},
     {"symbol":"COALINDIA", "name":"Coal India",                "sector":"Metals & Mining",    "price":480,  "marketCap":295000, "pe":8.4, "roe":42.8,"roce":52.1,"netMargin":18.4,"debtToEquity":0.0, "revenueGrowth5Y":8.2, "dividendYield":5.8},
     {"symbol":"DIVISLAB",  "name":"Divi's Laboratories",       "sector":"Healthcare",         "price":5800, "marketCap":154000, "pe":68.4,"roe":18.4,"roce":21.8,"netMargin":24.8,"debtToEquity":0.0, "revenueGrowth5Y":11.4,"dividendYield":0.7},
