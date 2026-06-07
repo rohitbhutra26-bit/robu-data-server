@@ -541,32 +541,43 @@ _NSE_CACHE_TTL_HOURS = 24
 def _nse(name: str, sector: str, sym: str) -> dict:
     return {"name": name, "sector": sector, "exchange": "NSE", "yf_ticker": f"{sym}.NS"}
 
+# Corporate action redirects — {old_symbol: new_symbol}
+# Applied at the start of all data endpoints so legacy symbols resolve automatically.
+_SYMBOL_REDIRECTS: dict[str, str] = {
+    # Nov 2025: Tata Motors demerged. TATAMOTORS → TMPV (Passenger Vehicles, original ISIN)
+    # + TMCV (Tata Motors Ltd, Commercial Vehicles).
+    # TMPV carries ISIN INE155A01022 (the original TATAMOTORS ISIN).
+    "TATAMOTORS": "TMPV",
+}
+
 _FALLBACK_STOCKS: dict[str, dict] = {
-    "RELIANCE":   _nse("Reliance Industries Ltd",           "Energy",                   "RELIANCE"),
-    "TCS":        _nse("Tata Consultancy Services Ltd",     "Information Technology",   "TCS"),
-    "INFY":       _nse("Infosys Ltd",                       "Information Technology",   "INFY"),
-    "HDFCBANK":   _nse("HDFC Bank Ltd",                     "Banking",                  "HDFCBANK"),
-    "ICICIBANK":  _nse("ICICI Bank Ltd",                    "Banking",                  "ICICIBANK"),
-    "WIPRO":      _nse("Wipro Ltd",                         "Information Technology",   "WIPRO"),
-    "BAJFINANCE": _nse("Bajaj Finance Ltd",                 "NBFC",                     "BAJFINANCE"),
-    "HINDUNILVR": _nse("Hindustan Unilever Ltd",            "FMCG",                     "HINDUNILVR"),
-    "ITC":        _nse("ITC Ltd",                           "FMCG",                     "ITC"),
-    "KOTAKBANK":  _nse("Kotak Mahindra Bank Ltd",           "Banking",                  "KOTAKBANK"),
-    "LT":         _nse("Larsen & Toubro Ltd",               "Infrastructure",           "LT"),
-    "AXISBANK":   _nse("Axis Bank Ltd",                     "Banking",                  "AXISBANK"),
-    "ASIANPAINT": _nse("Asian Paints Ltd",                  "Consumer",                 "ASIANPAINT"),
-    "MARUTI":     _nse("Maruti Suzuki India Ltd",           "Automobiles",              "MARUTI"),
-    "TITAN":      _nse("Titan Company Ltd",                 "Consumer",                 "TITAN"),
-    "SUNPHARMA":  _nse("Sun Pharmaceutical Industries Ltd", "Pharmaceuticals",          "SUNPHARMA"),
-    "HCLTECH":    _nse("HCL Technologies Ltd",              "Information Technology",   "HCLTECH"),
-    "TATAMOTORS": _nse("Tata Motors Ltd",                   "Automobiles",              "TATAMOTORS"),
-    "TATASTEEL":  _nse("Tata Steel Ltd",                    "Metals",                   "TATASTEEL"),
-    "SBIN":       _nse("State Bank of India",               "Banking",                  "SBIN"),
-    "ADANIENT":   _nse("Adani Enterprises Ltd",             "Conglomerate",             "ADANIENT"),
-    "BHARTIARTL": _nse("Bharti Airtel Ltd",                 "Telecom",                  "BHARTIARTL"),
-    "KAYNES":     _nse("Kaynes Technology India Ltd",       "Electronics",              "KAYNES"),
-    "NTPC":       _nse("NTPC Ltd",                          "Utilities",                "NTPC"),
-    "ONGC":       _nse("Oil & Natural Gas Corporation Ltd", "Energy",                   "ONGC"),
+    "RELIANCE":   _nse("Reliance Industries Ltd",                "Energy",                   "RELIANCE"),
+    "TCS":        _nse("Tata Consultancy Services Ltd",          "Information Technology",   "TCS"),
+    "INFY":       _nse("Infosys Ltd",                            "Information Technology",   "INFY"),
+    "HDFCBANK":   _nse("HDFC Bank Ltd",                          "Banking",                  "HDFCBANK"),
+    "ICICIBANK":  _nse("ICICI Bank Ltd",                         "Banking",                  "ICICIBANK"),
+    "WIPRO":      _nse("Wipro Ltd",                              "Information Technology",   "WIPRO"),
+    "BAJFINANCE": _nse("Bajaj Finance Ltd",                      "NBFC",                     "BAJFINANCE"),
+    "HINDUNILVR": _nse("Hindustan Unilever Ltd",                 "FMCG",                     "HINDUNILVR"),
+    "ITC":        _nse("ITC Ltd",                                "FMCG",                     "ITC"),
+    "KOTAKBANK":  _nse("Kotak Mahindra Bank Ltd",                "Banking",                  "KOTAKBANK"),
+    "LT":         _nse("Larsen & Toubro Ltd",                    "Infrastructure",           "LT"),
+    "AXISBANK":   _nse("Axis Bank Ltd",                          "Banking",                  "AXISBANK"),
+    "ASIANPAINT": _nse("Asian Paints Ltd",                       "Consumer",                 "ASIANPAINT"),
+    "MARUTI":     _nse("Maruti Suzuki India Ltd",                "Automobiles",              "MARUTI"),
+    "TITAN":      _nse("Titan Company Ltd",                      "Consumer",                 "TITAN"),
+    "SUNPHARMA":  _nse("Sun Pharmaceutical Industries Ltd",      "Pharmaceuticals",          "SUNPHARMA"),
+    "HCLTECH":    _nse("HCL Technologies Ltd",                   "Information Technology",   "HCLTECH"),
+    # TATAMOTORS demerged Nov 2025 → TMPV (PV business) + TMCV (CV business)
+    "TMPV":       _nse("Tata Motors Passenger Vehicles Ltd",     "Automobiles",              "TMPV"),
+    "TMCV":       _nse("Tata Motors Ltd",                        "Automobiles",              "TMCV"),
+    "TATASTEEL":  _nse("Tata Steel Ltd",                         "Metals",                   "TATASTEEL"),
+    "SBIN":       _nse("State Bank of India",                    "Banking",                  "SBIN"),
+    "ADANIENT":   _nse("Adani Enterprises Ltd",                  "Conglomerate",             "ADANIENT"),
+    "BHARTIARTL": _nse("Bharti Airtel Ltd",                      "Telecom",                  "BHARTIARTL"),
+    "KAYNES":     _nse("Kaynes Technology India Ltd",            "Electronics",              "KAYNES"),
+    "NTPC":       _nse("NTPC Ltd",                               "Utilities",                "NTPC"),
+    "ONGC":       _nse("Oil & Natural Gas Corporation Ltd",      "Energy",                   "ONGC"),
 }
 
 # In-memory stock universe: {SYMBOL: {name, sector}}
@@ -1098,6 +1109,7 @@ def search(q: str = ""):
 def company(symbol: str):
     """Return key company metrics — direct Yahoo Finance API via curl_cffi."""
     symbol = symbol.upper().strip()
+    symbol = _SYMBOL_REDIRECTS.get(symbol, symbol)   # handle demergers/renames
     cache_key = f"company:{symbol}"
     cached = _cache_get(cache_key)
     if cached is not None:
@@ -1182,6 +1194,7 @@ def company(symbol: str):
 def financials(symbol: str):
     """Return last 5 years of annual financials — direct Yahoo Finance API."""
     symbol = symbol.upper().strip()
+    symbol = _SYMBOL_REDIRECTS.get(symbol, symbol)   # handle demergers/renames
     cache_key = f"financials:{symbol}"
     cached = _cache_get(cache_key)
     if cached is not None:
@@ -1330,6 +1343,7 @@ def company_v2(symbol: str):
       Local universe → company name, exchange fallback
     """
     symbol = symbol.upper().strip()
+    symbol = _SYMBOL_REDIRECTS.get(symbol, symbol)   # handle demergers/renames
     cache_key = f"company_v2:{symbol}"
     cached = _cache_get(cache_key)
     if cached is not None:
@@ -1481,6 +1495,7 @@ def financials_v2(symbol: str):
     Falls back to /financials (Yahoo) if Screener is unavailable.
     """
     symbol = symbol.upper().strip()
+    symbol = _SYMBOL_REDIRECTS.get(symbol, symbol)   # handle demergers/renames
     cache_key = f"financials_v2:{symbol}"
     cached = _cache_get(cache_key)
     if cached is not None:
