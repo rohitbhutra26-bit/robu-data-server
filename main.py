@@ -1859,6 +1859,7 @@ def ohlc(symbol: str, period: str = "2y"):
     Tries the resolved exchange first, then falls back to the other suffix.
     """
     symbol = symbol.upper().strip()
+    symbol = _SYMBOL_REDIRECTS.get(symbol, symbol)   # handle demergers/renames
     cache_key = f"ohlc:{symbol}:{period}"
     cached = _cache_get(cache_key)
     if cached is not None:
