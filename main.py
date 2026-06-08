@@ -8,6 +8,7 @@ Run: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import RedirectResponse, HTMLResponse
 import pandas as pd
 import numpy as np
 import time
@@ -29,6 +30,10 @@ try:
     _CURL_AVAILABLE = True
 except ImportError:
     _CURL_AVAILABLE = False
+
+import csv
+import hashlib
+import io
 
 # ---------------------------------------------------------------------------
 # Screener.in Integration
@@ -1815,6 +1820,161 @@ def historical_valuation(symbol: str):
 
 
 # ---------------------------------------------------------------------------
+# Kite Connect (Zerodha) — reliable NSE/BSE candle data via the REST API.
+# Uses plain HTTP (no kiteconnect SDK) to keep the dependency tree light.
+# Requires env vars: KITE_API_KEY, KITE_API_SECRET
+# Daily login: visit  https://<this-server>/kite/login  each morning
+# (Kite access tokens expire ~7:30 AM IST, so one fresh login per day).
+# ---------------------------------------------------------------------------
+KITE_API_KEY     = os.environ.get("KITE_API_KEY", "")
+KITE_API_SECRET  = os.environ.get("KITE_API_SECRET", "")
+_KITE_HOST       = "https://api.kite.trade"
+_KITE_TOKEN_FILE = "/tmp/kite_token.json"
+_kite_access_token = ""
+_kite_token_date   = ""
+_kite_instruments: dict[str, int] = {}     # "TCS" -> instrument_token (NSE equity)
+_kite_inst_ts = 0.0
+
+
+def _get_kite_token() -> str:
+    """Return today's access token from memory, the token file, or env."""
+    global _kite_access_token, _kite_token_date
+    today = time.strftime("%Y-%m-%d")
+    if _kite_access_token and _kite_token_date == today:
+        return _kite_access_token
+    try:
+        with open(_KITE_TOKEN_FILE) as f:
+            d = json.load(f)
+        if d.get("date") == today and d.get("access_token"):
+            _kite_access_token, _kite_token_date = d["access_token"], today
+            return _kite_access_token
+    except Exception:
+        pass
+    env_tok = os.environ.get("KITE_ACCESS_TOKEN", "")
+    if env_tok:
+        _kite_access_token, _kite_token_date = env_tok, today
+        return env_tok
+    return ""
+
+
+def _save_kite_token(tok: str) -> None:
+    global _kite_access_token, _kite_token_date
+    _kite_access_token = tok
+    _kite_token_date = time.strftime("%Y-%m-%d")
+    try:
+        with open(_KITE_TOKEN_FILE, "w") as f:
+            json.dump({"date": _kite_token_date, "access_token": tok}, f)
+    except Exception:
+        pass
+
+
+def _kite_headers() -> dict | None:
+    tok = _get_kite_token()
+    if not KITE_API_KEY or not tok:
+        return None
+    return {"X-Kite-Version": "3", "Authorization": f"token {KITE_API_KEY}:{tok}"}
+
+
+def _kite_instrument_token(symbol: str) -> int | None:
+    """Map an NSE trading symbol (e.g. TCS) to its Kite instrument token."""
+    global _kite_instruments, _kite_inst_ts
+    headers = _kite_headers()
+    if not headers:
+        return None
+    if not _kite_instruments or time.time() - _kite_inst_ts > 86400:
+        try:
+            resp = requests.get(f"{_KITE_HOST}/instruments/NSE", headers=headers, timeout=30)
+            resp.raise_for_status()
+            reader = csv.DictReader(io.StringIO(resp.text))
+            mp: dict[str, int] = {}
+            for row in reader:
+                if row.get("segment") == "NSE":     # NSE = equity cash segment
+                    mp[row["tradingsymbol"]] = int(row["instrument_token"])
+            if mp:
+                _kite_instruments = mp
+                _kite_inst_ts = time.time()
+                print(f"[kite] loaded {len(_kite_instruments)} NSE instruments")
+        except Exception as e:
+            print(f"[kite] instruments load failed: {e}")
+            return None
+    return _kite_instruments.get(symbol.upper())
+
+
+def _kite_ohlc(symbol: str, period: str) -> list | None:
+    """Daily candles from Kite. Returns None if Kite is unavailable/not logged in."""
+    headers = _kite_headers()
+    if not headers:
+        return None
+    token = _kite_instrument_token(symbol)
+    if not token:
+        return None
+    days = {"6mo": 190, "1y": 370, "2y": 740, "5y": 1850}.get(period, 740)
+    to_d = datetime.now()
+    from_d = to_d - timedelta(days=days)
+    url = f"{_KITE_HOST}/instruments/historical/{token}/day"
+    params = {"from": from_d.strftime("%Y-%m-%d"), "to": to_d.strftime("%Y-%m-%d")}
+    try:
+        resp = requests.get(url, headers=headers, params=params, timeout=20)
+        resp.raise_for_status()
+        rows = (resp.json().get("data") or {}).get("candles") or []
+    except Exception as e:
+        print(f"[kite] historical failed for {symbol}: {e}")
+        return None
+    # each candle: [timestamp, open, high, low, close, volume]
+    candles = [{
+        "time":  str(c[0])[:10],
+        "open":  round(float(c[1]), 2),
+        "high":  round(float(c[2]), 2),
+        "low":   round(float(c[3]), 2),
+        "close": round(float(c[4]), 2),
+    } for c in rows if len(c) >= 5]
+    return candles or None
+
+
+@app.get("/kite/login")
+def kite_login():
+    """Redirect the user to Kite's login page (do this once each morning)."""
+    if not KITE_API_KEY:
+        raise HTTPException(503, "Kite not configured — set KITE_API_KEY and KITE_API_SECRET.")
+    return RedirectResponse(f"https://kite.zerodha.com/connect/login?v=3&api_key={KITE_API_KEY}")
+
+
+@app.get("/kite/callback")
+def kite_callback(request_token: str = "", status: str = ""):
+    """Kite redirects here after login; exchange the request token for an access token."""
+    if not request_token:
+        raise HTTPException(400, "Missing request_token")
+    checksum = hashlib.sha256(
+        (KITE_API_KEY + request_token + KITE_API_SECRET).encode()
+    ).hexdigest()
+    try:
+        resp = requests.post(
+            f"{_KITE_HOST}/session/token",
+            data={"api_key": KITE_API_KEY, "request_token": request_token, "checksum": checksum},
+            headers={"X-Kite-Version": "3"},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        tok = (resp.json().get("data") or {}).get("access_token")
+    except Exception as e:
+        raise HTTPException(400, f"Kite session exchange failed: {e}")
+    if not tok:
+        raise HTTPException(400, "Kite did not return an access token")
+    _save_kite_token(tok)
+    _kite_instruments.clear()  # force fresh instrument load with the new token
+    return HTMLResponse(
+        "<div style='font-family:system-ui;padding:40px;text-align:center'>"
+        "<h2>✓ Kite connected</h2>"
+        "<p>Live Kite data is active for today. You can close this tab.</p></div>"
+    )
+
+
+@app.get("/kite/status")
+def kite_status():
+    return {"configured": bool(KITE_API_KEY), "logged_in": bool(_get_kite_token())}
+
+
+# ---------------------------------------------------------------------------
 # Daily OHLC candles — powers the TradingView Lightweight price chart
 # ---------------------------------------------------------------------------
 def _yf_chart(symbol_ns: str, rng: str = "2y", interval: str = "1d") -> dict:
@@ -1865,6 +2025,15 @@ def ohlc(symbol: str, period: str = "2y"):
     if cached is not None:
         return cached
 
+    # 1) Prefer Kite (Zerodha) — real exchange data, most reliable for NSE/BSE
+    kite_candles = _kite_ohlc(symbol, period)
+    if kite_candles:
+        result = {"symbol": symbol, "candles": kite_candles, "source": "kite"}
+        _cache_set(cache_key, result)
+        print(f"[ohlc] {symbol}: {len(kite_candles)} candles (kite) ✓")
+        return result
+
+    # 2) Fall back to Yahoo Finance
     ticker, _ = _resolve_ticker(symbol)
     try:
         res = _yf_chart(ticker, rng=period)
