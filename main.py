@@ -1480,6 +1480,20 @@ def company_v2(symbol: str):
     # Derive EPS from price / PE (when Screener doesn't give EPS directly)
     eps = round(price_val / pe, 2) if pe and pe > 0 else 0.0
 
+    # Screener leaves Stock P/E blank when core/normalized earnings are negative
+    # (e.g. profits driven by exceptional gains). Derive P/E from latest annual
+    # EPS so the frontend shows a real number instead of 0.0x.
+    if (not pe or pe <= 0) and price_val > 0:
+        try:
+            fin_rows = _parse_screener_financials(soup)
+            if fin_rows:
+                last_eps = fin_rows[-1].get("eps", 0.0)
+                if last_eps and last_eps > 0:
+                    pe  = round(price_val / last_eps, 1)
+                    eps = last_eps
+        except Exception:
+            pass
+
     # Sector: prefer Screener's own industry tag, then screener sector, then universe
     sector   = ratios.get("screenerIndustry") or ratios.get("sector") or stock_meta.get("sector", "Unknown")
     industry = ratios.get("screenerIndustry", "")
