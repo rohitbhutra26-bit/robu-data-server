@@ -322,6 +322,9 @@ def _parse_screener_ratios(soup: Any) -> dict:
                             pass
                 elif "face value" in name or "face val" in name:
                     ratios["faceValue"] = float(value)
+                elif "pledged" in name:
+                    # "Pledged percentage" — promoter shares pledged as loan collateral
+                    ratios["pledgedPct"] = float(value)
             except (ValueError, TypeError):
                 pass
 
@@ -477,6 +480,7 @@ def _parse_screener_financials(soup: Any) -> list:
 
     pl_years, pl_rows = _parse_table("profit-loss")
     cf_years, cf_rows = _parse_table("cash-flow")
+    bs_years, bs_rows = _parse_table("balance-sheet")
 
     if not pl_years:
         return []
@@ -487,6 +491,18 @@ def _parse_screener_financials(soup: Any) -> list:
     ebitdas  = _row(pl_rows, "operating profit")
     opm_pcts = _row(pl_rows, "opm %", "opm%", "operating profit margin")
     ocfs     = _row(cf_rows, "cash from operating", "operating activities", "net cash from operating")
+    interests = _row(pl_rows, "interest", "finance cost")
+
+    # Balance-sheet rows — mapped by year label (BS years can differ from P&L years)
+    borrow_vals  = _row(bs_rows, "borrowings", "total debt")
+    eqcap_vals   = _row(bs_rows, "equity capital", "equity share capital", "share capital")
+    reserve_vals = _row(bs_rows, "reserves")
+    bs_borrow = {y: (borrow_vals[i] if i < len(borrow_vals) else 0.0) for i, y in enumerate(bs_years)}
+    bs_equity = {
+        y: (eqcap_vals[i] if i < len(eqcap_vals) else 0.0)
+           + (reserve_vals[i] if i < len(reserve_vals) else 0.0)
+        for i, y in enumerate(bs_years)
+    }
 
     result = []
     prev_rev: float = 0.0
@@ -501,6 +517,7 @@ def _parse_screener_financials(soup: Any) -> list:
         ebit = ebitdas[i]  if i < len(ebitdas)   else 0.0
         opm  = opm_pcts[i] if i < len(opm_pcts)  else 0.0
         ocf  = ocfs[i]     if i < len(ocfs)       else 0.0
+        intr = interests[i] if i < len(interests) else 0.0
 
         net_margin   = round((pat / rev) * 100, 2)  if rev > 0 else 0.0
         ebitda_pct   = opm if opm != 0 else (round((ebit / rev) * 100, 2) if rev > 0 else 0.0)
@@ -517,6 +534,9 @@ def _parse_screener_financials(soup: Any) -> list:
             "revenueGrowth": rev_growth,
             "ebitdaMargin":  round(ebitda_pct, 2),
             "ocf":           round(ocf,  2),   # Operating Cash Flow — not in Yahoo Finance
+            "interest":      round(intr, 2),   # Interest expense — for coverage ratio
+            "borrowings":    round(bs_borrow.get(yr, 0.0), 2),  # Total debt from balance sheet
+            "equity":        round(bs_equity.get(yr, 0.0), 2),  # Equity capital + reserves
             "source":        "screener",
         })
 
@@ -1484,6 +1504,7 @@ def company_v2(symbol: str):
         "beta":           0.0,    # Not needed for a valuation tool
         "revenueGrowth":  0.0,    # Computed from financials-v2 instead
         "earningsGrowth": 0.0,
+        "pledgedPct":     ratios.get("pledgedPct"),  # Promoter pledge % (null = not published on page)
         "dataSource":     f"screener+{price_src}",
     }
 
