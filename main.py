@@ -1458,6 +1458,20 @@ def company_v2(symbol: str):
     roe         = ratios.get("roe", 0.0)
     roce        = ratios.get("roce", 0.0)
     de          = ratios.get("debtToEquity", 0.0)
+
+    # Screener's top-ratios box rarely includes D/E → compute from the
+    # balance sheet: Borrowings ÷ (Equity Capital + Reserves), latest year.
+    if not de:
+        try:
+            fin_rows = _parse_screener_financials(soup)
+            for row in reversed(fin_rows):
+                borrow = row.get("borrowings", 0.0)
+                equity = row.get("equity", 0.0)
+                if equity > 0:
+                    de = round(borrow / equity, 2)
+                    break
+        except Exception as de_err:
+            print(f"[company-v2] D/E from balance sheet failed for {symbol}: {de_err}")
     div_yield   = ratios.get("dividendYield", 0.0)
     book_value  = ratios.get("bookValue", 0.0)
     w52_high    = ratios.get("week52High", 0.0)
