@@ -702,22 +702,28 @@ def _load_bse_universe():
 
         added = 0
         for item in items:
-            code = str(item.get("Scripcode", "")).strip()
-            name = str(item.get("Scrip_Name", "")).strip()
-            isin = str(item.get("ISIN_NO", "")).strip()
-            sector = str(item.get("industry", "BSE Listed")).strip() or "BSE Listed"
+            # BSE API field names (verified June 2026):
+            # SCRIP_CD (numeric), Scrip_Name, ISIN_NUMBER, INDUSTRY, scrip_id (ticker)
+            code   = str(item.get("SCRIP_CD",    item.get("Scripcode", ""))).strip()
+            name   = str(item.get("Scrip_Name",  "")).strip()
+            isin   = str(item.get("ISIN_NUMBER", item.get("ISIN_NO", ""))).strip()
+            sector = str(item.get("INDUSTRY",    item.get("industry", "")) or "").strip() or "BSE Listed"
+            sid    = str(item.get("scrip_id",    "")).strip().upper()
             if not code or not name:
                 continue
             # Already in NSE universe (matched by ISIN) — skip, NSE is primary
             if isin and isin in isin_to_nse:
                 continue
-            # BSE-only stock — add with numeric code as identifier
-            if code not in STOCK_UNIVERSE:
-                STOCK_UNIVERSE[code] = {
+            # BSE-only stock — prefer the alphanumeric scrip_id (searchable,
+            # Screener-compatible), fall back to numeric code
+            key = sid or code
+            if key not in STOCK_UNIVERSE:
+                STOCK_UNIVERSE[key] = {
                     "name": name,
                     "sector": sector,
                     "exchange": "BSE",
                     "isin": isin,
+                    "bseCode": code,
                     "yf_ticker": f"{code}.BO",
                 }
                 added += 1
