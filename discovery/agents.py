@@ -94,30 +94,88 @@ def _looks_valid(out: Dict[str, Any]) -> bool:
     return all(k in out for k in ("financial", "industry", "market", "futureTrends", "skeptic"))
 
 
+# Map real sectors → a relevant tailwind theme + a sector-specific risk, so the
+# no-AI fallback is differentiated per stock instead of one generic template.
+_SECTOR_PROFILE = {
+    "technology":        ("Artificial Intelligence adoption", "AI could compress services pricing"),
+    "software":          ("Enterprise AI & cloud spend", "AI disruption to legacy revenue"),
+    "financial":         ("Credit growth & formalisation", "Asset-quality / credit-cycle risk"),
+    "bank":              ("Credit growth & deposit franchise", "NPA / credit-cycle risk"),
+    "healthcare":        ("Specialty & chronic-care demand", "USFDA / pricing regulation risk"),
+    "pharma":            ("Complex generics & CDMO demand", "USFDA / price-erosion risk"),
+    "automobile":        ("EV transition & premiumisation", "Demand cyclicality & input costs"),
+    "auto":              ("EV ecosystem build-out", "Commodity & demand cyclicality"),
+    "metals":            ("Infra & capex up-cycle", "Commodity-price cyclicality"),
+    "mining":            ("Energy & base-load demand", "Energy-transition headwind"),
+    "energy":            ("Energy transition & power demand", "Regulated pricing / policy risk"),
+    "power":             ("Rising power demand & grid capex", "Regulated returns / fuel risk"),
+    "oil":               ("Refining margins & gas demand", "Crude-price volatility"),
+    "consumer":          ("Premiumisation & rural recovery", "Input-cost inflation, slow volumes"),
+    "fmcg":              ("Distribution & premiumisation", "Volume growth & margin pressure"),
+    "capital goods":     ("Capex & infrastructure up-cycle", "Order-execution & working-capital risk"),
+    "defence":           ("Defence indigenisation orders", "Budget dependence & order lumpiness"),
+    "chemical":          ("Specialty chemicals import-substitution", "China dumping / cyclicality"),
+    "realty":            ("Housing up-cycle & consolidation", "Interest-rate & demand cyclicality"),
+    "infrastructure":    ("Government infra capex", "Execution & leverage risk"),
+    "services":          ("Formalisation & digital adoption", "Competitive intensity"),
+    "communication":     ("Data consumption & tariff hikes", "Capex intensity & competition"),
+}
+
+
+def _sector_profile(sector: str) -> tuple:
+    s = (sector or "").lower()
+    for key, prof in _SECTOR_PROFILE.items():
+        if key in s:
+            return prof
+    return ("Sector demand & operating leverage", "Competitive intensity")
+
+
 def _fallback(stock: Dict[str, Any], signals: Dict[str, float],
               news: List[Dict[str, str]], fiidii: Dict[str, Any]) -> Dict[str, Any]:
-    """No-AI synthesis from quant signals so the engine still works offline."""
+    """No-AI synthesis from quant signals — differentiated per stock by its own
+    numbers and sector, so cards never read identically."""
     q = signals
     fin = int(round(0.6 * q["quality"] + 0.4 * q["growth"]))
     ind = int(round(0.5 * q["growth"] + 0.5 * q["quality"]))
     mkt = int(round(0.6 * q["valuation"] + 0.4 * q["underFollowed"]))
     fut = int(round(0.5 * q["growth"] + 0.5 * q["underFollowed"]))
-    sector = (stock.get("sector") or "").lower()
-    theme = next((t for t in TREND_THEMES if t.split()[0].lower() in sector), "Specialty Manufacturing")
-    recent = news[0]["subject"][:120] if news else "steady operations, no major surprises"
+
+    name = stock.get("name", stock.get("symbol", "This company"))
+    roe = stock.get("roe", "?"); roce = stock.get("roce", "?")
+    pe = stock.get("pe", "?"); pat_g = stock.get("patGrowth5Y", "?")
+    rev_g = stock.get("revenueGrowth5Y", "?"); de = stock.get("debtToEquity", 0)
+    tailwind, sector_risk = _sector_profile(stock.get("sector", ""))
+
+    # whyNow varies by the stock's actual profile.
+    try:
+        cheap = float(pe) > 0 and float(pe) <= 22
+    except (TypeError, ValueError):
+        cheap = False
+    if q["underFollowed"] >= 60 and q["growth"] >= 55:
+        whynow = f"{name} grows PAT ~{pat_g}% on {roe}% ROE yet is still a smaller, under-owned name — the kind the crowd finds late."
+    elif cheap:
+        whynow = f"At ~{pe}x earnings with {roce}% ROCE, {name} looks under-priced versus its {rev_g}% revenue growth."
+    elif q["quality"] >= 65:
+        whynow = f"{name} earns a high {roe}% ROE with {('low' if (de or 0) < 0.5 else 'manageable')} debt — durable quality the market under-rates."
+    else:
+        whynow = f"{name} shows improving momentum ({pat_g}% PAT growth) that hasn't fully shown up in the price yet."
+
+    recent = news[0]["subject"][:130] if news else f"No major filings; thesis rests on {rev_g}% growth and {roe}% returns."
+    leverage_risk = "High debt adds refinancing risk" if (de or 0) >= 1.0 else None
+    val_risk = "Valuation leaves little margin for error" if q["valuation"] < 40 else None
+    risks = [r for r in (val_risk, sector_risk, leverage_risk) if r][:3] or ["Execution risk on growth"]
+
     return {
-        "financial":   {"score": fin, "reason": f"ROE {stock.get('roe','?')}%, 5Y PAT growth {stock.get('patGrowth5Y','?')}%."},
-        "management":  {"score": int(round(0.5 * (fin + q['quality']))), "reason": "Inferred from return ratios and consistency."},
-        "industry":    {"score": ind, "reason": f"{stock.get('sector','Sector')} momentum from growth profile.", "transformationScore": ind},
-        "market":      {"score": mkt, "reason": f"P/E {stock.get('pe','?')}x vs growth; flows {fiidii.get('tone')}.",
-                         "whyMarketMayBeWrong": "Crowd may under-rate the growth-to-valuation gap."},
-        "news":        {"score": min(70, mkt), "reason": recent, "narrativeShift": "Awaiting a clear catalyst in filings."},
-        "futureTrends":{"score": fut, "reason": f"Exposure to {theme}.", "readinessScore": fut,
-                         "tailwinds": [f"{theme} demand", "Operating leverage on growth"], "threats": ["Competitive intensity"], "theme": theme},
-        "skeptic":     {"penalty": 8 if q["valuation"] < 40 else 4,
-                         "keyRisks": ["Valuation leaves little margin for error" if q["valuation"] < 40 else "Execution risk on growth",
-                                      "Cyclical or demand sensitivity"]},
-        "whyFound": f"{stock.get('name')} screens well on quality and growth while still {('a smaller, under-followed name' if q['underFollowed']>50 else 'reasonably valued')}.",
-        "whyNow": "Fundamentals and momentum line up before broad recognition.",
-        "hiddenOptionality": f"Upside if {theme.lower()} adoption accelerates faster than priced in.",
+        "financial":   {"score": fin, "reason": f"ROE {roe}%, ROCE {roce}%, 5Y PAT growth {pat_g}%."},
+        "management":  {"score": int(round(0.5 * (fin + q['quality']))), "reason": f"Consistent {roe}% returns imply disciplined capital allocation."},
+        "industry":    {"score": ind, "reason": f"{stock.get('sector','Sector')} riding {tailwind.lower()}.", "transformationScore": ind},
+        "market":      {"score": mkt, "reason": f"P/E {pe}x vs {rev_g}% growth; market flows {fiidii.get('tone')}.",
+                         "whyMarketMayBeWrong": f"Crowd anchors on the past and under-rates {name}'s growth-to-valuation gap."},
+        "news":        {"score": min(70, mkt), "reason": recent, "narrativeShift": f"Re-rating likely as {tailwind.lower()} plays out."},
+        "futureTrends":{"score": fut, "reason": f"Exposure to {tailwind}.", "readinessScore": fut,
+                         "tailwinds": [tailwind, f"Operating leverage on {rev_g}% growth"], "threats": [sector_risk], "theme": tailwind},
+        "skeptic":     {"penalty": 8 if q["valuation"] < 40 else 4, "keyRisks": risks},
+        "whyFound": f"{name} scores well on quality (ROE {roe}%) and growth (PAT {pat_g}%) while still {('under-followed' if q['underFollowed']>50 else 'reasonably valued')}.",
+        "whyNow": whynow,
+        "hiddenOptionality": f"Upside if {tailwind.lower()} accelerates faster than the market prices in.",
     }

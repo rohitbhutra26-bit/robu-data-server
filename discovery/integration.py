@@ -27,9 +27,16 @@ from .orchestrator import run_once, is_running
 
 def _scheduler_loop(deps: DiscoveryDeps, store: DiscoveryStore, hour_utc: int) -> None:
     last_run_date: Optional[str] = None
-    # One-off run on boot if the store has never produced a feed.
-    if not store.latest_run():
-        print("[discovery] no prior feed — running an initial batch on boot")
+    # Run on boot if there's no feed yet, OR if the last feed was the non-AI
+    # fallback while an AI key is now available (so a deploy that fixes the
+    # model automatically refreshes the feed with real AI narratives).
+    last = store.latest_run()
+    needs_boot = (last is None) or (
+        deps.gemini_api_key and (last["source"] if last else "") != "ai"
+    )
+    if needs_boot:
+        reason = "no prior feed" if last is None else "upgrading fallback feed to AI"
+        print(f"[discovery] boot run — {reason}")
         try:
             run_once(deps, store)
             last_run_date = datetime.utcnow().strftime("%Y-%m-%d")
