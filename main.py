@@ -3332,3 +3332,33 @@ def get_announcements(symbol: str, limit: int = 10):
     # Fallback — return empty so frontend handles gracefully
     return {"symbol": symbol, "announcements": [], "source": "nse", "error": "unavailable"}
 
+
+
+# ===========================================================================
+# ROBU Discovery Engine — wiring (self-contained package in ./discovery)
+# ---------------------------------------------------------------------------
+# Heavy work runs as a nightly batch inside this package and is stored in
+# SQLite; the /discovery endpoints just read it. See the discovery/ package
+# and ROBU_Discovery_Engine_Architecture.docx for the full design.
+# ===========================================================================
+try:
+    from discovery import init_discovery, DiscoveryDeps
+
+    def _discovery_universe():
+        with _CACHE_LOCK:
+            return list(_SCREENER_CACHE)
+
+    _discovery_deps = DiscoveryDeps(
+        get_universe=_discovery_universe,
+        fetch_company=company_v2,
+        fetch_financials=financials,
+        fetch_announcements=get_announcements,
+        fetch_historical=historical_valuation,
+        gemini_api_key=os.environ.get("GEMINI_API_KEY", ""),
+        data_dir=os.path.dirname(os.path.abspath(__file__)),
+        max_candidates=int(os.environ.get("DISCOVERY_MAX_CANDIDATES", "60")),
+    )
+    init_discovery(app, _discovery_deps)
+    print("[ROBU] Discovery Engine mounted at /discovery")
+except Exception as _disc_err:
+    print(f"[ROBU] Discovery Engine NOT mounted: {_disc_err}")

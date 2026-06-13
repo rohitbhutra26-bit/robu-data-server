@@ -4,3 +4,8 @@ __pycache__
 *.log
 .data.log
 .web.log
+
+# Discovery Engine runtime store
+discovery_data/
+*.db
+__pycache__/
