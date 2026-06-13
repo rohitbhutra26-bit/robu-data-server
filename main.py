@@ -34,6 +34,7 @@ except ImportError:
 import csv
 import hashlib
 import io
+import difflib as _difflib
 
 # ---------------------------------------------------------------------------
 # Screener.in Integration
@@ -670,15 +671,50 @@ def _load_nse_universe():
     print(f"[ROBU] Using fallback list of {len(STOCK_UNIVERSE)} stocks.")
 
 
-def _load_bse_universe():
-    """Fetch BSE equity list and add BSE-only stocks (not already in NSE) to universe."""
+_BSE_SEED_FILE = os.path.join(os.path.dirname(__file__), "bse_seed.json")
+
+
+def _merge_bse_records(records: list[dict]) -> int:
+    """Merge normalized BSE records {code,name,isin,sector,sid} into STOCK_UNIVERSE.
+    Skips stocks already present via NSE (matched by ISIN). Returns count added."""
     global STOCK_UNIVERSE
-    # Build ISIN → NSE symbol map from current universe
     isin_to_nse = {
         info.get("isin", ""): sym
         for sym, info in STOCK_UNIVERSE.items()
         if info.get("isin")
     }
+    added = 0
+    for rec in records:
+        code   = str(rec.get("code", "")).strip()
+        name   = str(rec.get("name", "")).strip()
+        isin   = str(rec.get("isin", "") or "").strip()
+        sector = str(rec.get("sector", "") or "").strip() or "BSE Listed"
+        sid    = str(rec.get("sid", "") or "").strip().upper()
+        if not code or not name:
+            continue
+        # Already in NSE universe (matched by ISIN) — skip, NSE is primary
+        if isin and isin in isin_to_nse:
+            continue
+        # BSE-only stock — prefer the alphanumeric scrip_id (searchable,
+        # Screener-compatible), fall back to numeric code
+        key = sid or code
+        if key not in STOCK_UNIVERSE:
+            STOCK_UNIVERSE[key] = {
+                "name": name,
+                "sector": sector,
+                "exchange": "BSE",
+                "isin": isin,
+                "bseCode": code,
+                "yf_ticker": f"{code}.BO",
+            }
+            added += 1
+    return added
+
+
+def _fetch_bse_live() -> list[dict] | None:
+    """Fetch the live BSE equity list. Returns normalized records, or None on failure.
+    BSE blocks many datacenter IPs, so this routinely fails in production — callers
+    must fall back to the committed seed file (_BSE_SEED_FILE)."""
     try:
         if _CURL_AVAILABLE:
             _bse_sess = cffi_requests.Session(impersonate="chrome120")
@@ -693,43 +729,60 @@ def _load_bse_universe():
             }
             resp = requests.get(_BSE_LIST_URL, headers=headers, timeout=30)
         if not resp.ok:
-            print(f"[ROBU] BSE list HTTP {resp.status_code} — skipping BSE universe")
-            return
+            print(f"[ROBU] BSE list HTTP {resp.status_code} — falling back to seed")
+            return None
         items = resp.json()
-        if not isinstance(items, list):
-            print("[ROBU] BSE list unexpected format — skipping")
-            return
-
-        added = 0
-        for item in items:
-            # BSE API field names (verified June 2026):
-            # SCRIP_CD (numeric), Scrip_Name, ISIN_NUMBER, INDUSTRY, scrip_id (ticker)
-            code   = str(item.get("SCRIP_CD",    item.get("Scripcode", ""))).strip()
-            name   = str(item.get("Scrip_Name",  "")).strip()
-            isin   = str(item.get("ISIN_NUMBER", item.get("ISIN_NO", ""))).strip()
-            sector = str(item.get("INDUSTRY",    item.get("industry", "")) or "").strip() or "BSE Listed"
-            sid    = str(item.get("scrip_id",    "")).strip().upper()
-            if not code or not name:
-                continue
-            # Already in NSE universe (matched by ISIN) — skip, NSE is primary
-            if isin and isin in isin_to_nse:
-                continue
-            # BSE-only stock — prefer the alphanumeric scrip_id (searchable,
-            # Screener-compatible), fall back to numeric code
-            key = sid or code
-            if key not in STOCK_UNIVERSE:
-                STOCK_UNIVERSE[key] = {
-                    "name": name,
-                    "sector": sector,
-                    "exchange": "BSE",
-                    "isin": isin,
-                    "bseCode": code,
-                    "yf_ticker": f"{code}.BO",
-                }
-                added += 1
-        print(f"[ROBU] BSE universe merged: {added} BSE-only stocks added")
+        if not isinstance(items, list) or not items:
+            print("[ROBU] BSE list empty/unexpected — falling back to seed")
+            return None
+        # Normalize to the same shape as the seed file
+        records = []
+        for it in items:
+            records.append({
+                "code":   str(it.get("SCRIP_CD",    it.get("Scripcode", ""))).strip(),
+                "name":   str(it.get("Scrip_Name",  "")).strip(),
+                "isin":   str(it.get("ISIN_NUMBER", it.get("ISIN_NO", "")) or "").strip(),
+                "sector": str(it.get("INDUSTRY",    it.get("industry", "")) or "").strip() or "BSE Listed",
+                "sid":    str(it.get("scrip_id",    "")).strip().upper(),
+            })
+        # Opportunistically refresh the committed seed so it stays current
+        try:
+            with open(_BSE_SEED_FILE, "w") as f:
+                json.dump({"saved_at": datetime.now().isoformat(), "count": len(records), "stocks": records}, f, separators=(",", ":"))
+        except Exception:
+            pass
+        return records
     except Exception as e:
-        print(f"[ROBU] BSE universe load failed: {e}")
+        print(f"[ROBU] BSE live fetch failed: {e} — falling back to seed")
+        return None
+
+
+def _load_bse_seed() -> list[dict]:
+    """Load the committed BSE seed file (guaranteed fallback that survives ephemeral
+    production filesystems, since it ships in the repo)."""
+    try:
+        with open(_BSE_SEED_FILE) as f:
+            data = json.load(f)
+        return data.get("stocks", [])
+    except Exception as e:
+        print(f"[ROBU] BSE seed load failed: {e}")
+        return []
+
+
+def _load_bse_universe():
+    """Add BSE-only stocks to the universe. Tries the live BSE API first; if that is
+    blocked (common on cloud hosts), falls back to the committed seed file so BSE
+    stocks are ALWAYS searchable."""
+    records = _fetch_bse_live()
+    source = "live API"
+    if not records:
+        records = _load_bse_seed()
+        source = "committed seed"
+    if not records:
+        print("[ROBU] BSE universe: no data from live API or seed — BSE stocks unavailable")
+        return
+    added = _merge_bse_records(records)
+    print(f"[ROBU] BSE universe merged: {added} BSE-only stocks added (source: {source})")
 
 
 def _get_yf_ticker(symbol: str) -> str:
@@ -790,12 +843,12 @@ _cache: dict[str, tuple[Any, float]] = {}
 CACHE_TTL = 900  # 15 minutes
 
 
-def _cache_get(key: str) -> Any | None:
+def _cache_get(key: str, ttl: float | None = None) -> Any | None:
     entry = _cache.get(key)
     if entry is None:
         return None
     data, ts = entry
-    if time.time() - ts > CACHE_TTL:
+    if time.time() - ts > (ttl if ttl is not None else CACHE_TTL):
         del _cache[key]
         return None
     return data
@@ -1033,13 +1086,16 @@ def health():
     return {"status": "ok", "universe_size": len(STOCK_UNIVERSE)}
 
 
-def _search_row(sym: str, info: dict) -> dict:
-    """Return clean search result — only fields the frontend needs."""
+def _search_row(sym: str, info: dict, match: str = "contains") -> dict:
+    """Return clean search result — only fields the frontend needs.
+    `match` tags how the row was found: exact | starts | contains | fuzzy —
+    the frontend uses this to render a 'Did you mean…' prompt for typos."""
     return {
         "symbol": sym,
         "name": info.get("name", sym),
         "sector": info.get("sector", ""),
         "exchange": info.get("exchange", "NSE"),
+        "match": match,
     }
 
 
@@ -1117,22 +1173,43 @@ def search(q: str = ""):
     for sym, info in STOCK_UNIVERSE.items():
         sym_lower = sym.lower()
         name_lower = info.get("name", "").lower()
-        row = _search_row(sym, info)
         if sym_lower == q_lower:
-            exact.append(row)
+            exact.append(_search_row(sym, info, "exact"))
         elif sym_lower.startswith(q_lower) or name_lower.startswith(q_lower):
-            starts.append(row)
+            starts.append(_search_row(sym, info, "starts"))
         elif q_lower in sym_lower or q_lower in name_lower:
-            contains.append(row)
+            contains.append(_search_row(sym, info, "contains"))
 
     # NSE results first within each tier, then BSE
     def _rank(r): return 0 if r["exchange"] == "NSE" else 1
     exact.sort(key=_rank)
     starts.sort(key=_rank)
     contains.sort(key=_rank)
-    local = (exact + starts + contains)[:20]
+    local = exact + starts + contains
 
-    # Yahoo Finance search fallback removed — search is now NSE universe only
+    # ── Fuzzy "did you mean" fallback ──────────────────────────────────────
+    # When the query has no strong match (likely a typo: "relianse", "infoys"),
+    # find the closest symbols/names so the frontend can prompt a correction.
+    if len(local) < 6 and len(q_lower) >= 3:
+        seen = {r["symbol"] for r in local}
+        scored: list[tuple[float, dict]] = []
+        for sym, info in STOCK_UNIVERSE.items():
+            if sym in seen:
+                continue
+            sym_lower = sym.lower()
+            name_lower = info.get("name", "").lower()
+            # Similarity vs the symbol (weighted higher — a ticker match is the
+            # strongest signal) and vs each word of the company name.
+            sym_score  = _difflib.SequenceMatcher(None, q_lower, sym_lower).ratio()
+            name_score = max((_difflib.SequenceMatcher(None, q_lower, w).ratio()
+                              for w in name_lower.split()), default=0.0)
+            score = max(sym_score, name_score * 0.92)
+            if score >= 0.62:
+                scored.append((score, _search_row(sym, info, "fuzzy")))
+        # Highest similarity first; NSE before BSE on ties
+        scored.sort(key=lambda t: (-t[0], _rank(t[1])))
+        local.extend(r for _, r in scored[:8])
+
     return local[:20]
 
 
@@ -1599,32 +1676,69 @@ def financials_v2(symbol: str):
         return []   # Empty list: company page loads but valuation charts are blank
 
 
+_PRICE_TTL = 60  # seconds — keep portfolio/watchlist quotes near-live
+
+
+def _yf_intraday_price(symbol: str) -> dict | None:
+    """Live intraday quote from Yahoo Finance for NSE (.NS) or BSE (.BO).
+    Returns {price, change, changePct, prevClose} or None. Works during market
+    hours (delayed ~15m) AND for BSE-only stocks that NSE Bhavcopy never covers."""
+    try:
+        ns, _ = _resolve_ticker(symbol)
+        pr = _yf_summary(ns, "price").get("price", {})
+        p  = pr.get("regularMarketPrice")
+        if p is None or float(p) <= 0:
+            return None
+        p  = float(p)
+        pc = float(pr.get("regularMarketPreviousClose") or 0)
+        chg = float(pr.get("regularMarketChange") or (p - pc if pc else 0))
+        # Compute % ourselves — Yahoo's formatted=false percent is an inconsistent
+        # fraction (0.0238 vs 2.38); deriving it from change/prevClose is reliable.
+        chg_pct = (chg / pc * 100) if pc else 0.0
+        return {"price": round(p, 2), "change": round(chg, 2),
+                "changePct": round(chg_pct, 2), "prevClose": round(pc, 2)}
+    except Exception:
+        return None
+
+
 @app.get("/price/{symbol}")
 def price(symbol: str):
-    """Quick current price — NSE Bhavcopy (official EOD). No Yahoo Finance."""
+    """Current price — live Yahoo intraday first (NSE + BSE), then NSE Bhavcopy
+    (official EOD), then Screener. 60-second cache keeps it near-live."""
     symbol = symbol.upper().strip()
+    symbol = _SYMBOL_REDIRECTS.get(symbol, symbol)
     cache_key = f"price:{symbol}"
-    cached = _cache_get(cache_key)
+    cached = _cache_get(cache_key, ttl=_PRICE_TTL)
     if cached is not None:
         return cached
 
+    # 1) Live intraday (handles both NSE and BSE-only stocks)
+    live = _yf_intraday_price(symbol)
+    if live:
+        result = {"symbol": symbol, **live, "source": "live"}
+        _cache_set(cache_key, result)
+        return result
+
+    # 2) NSE Bhavcopy — official end-of-day close
     bhav = _bhavcopy_price(symbol)
     if bhav and bhav.get("close", 0) > 0:
         p = bhav["close"]
         pc = bhav.get("prevClose", 0)
         chg = round(p - pc, 2) if pc else 0.0
         chg_pct = round((chg / pc) * 100, 2) if pc else 0.0
-        result = {"symbol": symbol, "price": p, "change": chg, "changePct": chg_pct, "source": "bhavcopy"}
+        result = {"symbol": symbol, "price": p, "change": chg, "changePct": chg_pct,
+                  "prevClose": pc, "source": "bhavcopy"}
         _cache_set(cache_key, result)
         return result
 
-    # Fallback: try Screener's current price
+    # 3) Screener current price (last resort)
     soup = _fetch_screener_page(symbol)
     if soup:
         ratios = _parse_screener_ratios(soup)
         p = ratios.get("currentPrice", 0)
         if p:
-            result = {"symbol": symbol, "price": p, "change": 0.0, "changePct": 0.0, "source": "screener"}
+            result = {"symbol": symbol, "price": p, "change": 0.0, "changePct": 0.0,
+                      "prevClose": 0, "source": "screener"}
             _cache_set(cache_key, result)
             return result
 
