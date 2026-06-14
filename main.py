@@ -3534,24 +3534,30 @@ def get_announcements(symbol: str, limit: int = 10):
 # SQLite; the /discovery endpoints just read it. See the discovery/ package
 # and ROBU_Discovery_Engine_Architecture.docx for the full design.
 # ===========================================================================
-try:
-    from discovery import init_discovery, DiscoveryDeps
+# Discovery is PARKED (removed from the live app 2026-06-14). It still spams
+# Gemini HTTP 429 quota errors in the deploy logs via its boot/batch run, so the
+# wiring is gated OFF by default. To revive: set env DISCOVERY_ENABLED=true.
+if os.environ.get("DISCOVERY_ENABLED", "").lower() == "true":
+    try:
+        from discovery import init_discovery, DiscoveryDeps
 
-    def _discovery_universe():
-        with _CACHE_LOCK:
-            return list(_SCREENER_CACHE)
+        def _discovery_universe():
+            with _CACHE_LOCK:
+                return list(_SCREENER_CACHE)
 
-    _discovery_deps = DiscoveryDeps(
-        get_universe=_discovery_universe,
-        fetch_company=company_v2,
-        fetch_financials=financials,
-        fetch_announcements=get_announcements,
-        fetch_historical=historical_valuation,
-        gemini_api_key=os.environ.get("GEMINI_API_KEY", ""),
-        data_dir=os.path.dirname(os.path.abspath(__file__)),
-        max_candidates=int(os.environ.get("DISCOVERY_MAX_CANDIDATES", "60")),
-    )
-    init_discovery(app, _discovery_deps)
-    print("[ROBU] Discovery Engine mounted at /discovery")
-except Exception as _disc_err:
-    print(f"[ROBU] Discovery Engine NOT mounted: {_disc_err}")
+        _discovery_deps = DiscoveryDeps(
+            get_universe=_discovery_universe,
+            fetch_company=company_v2,
+            fetch_financials=financials,
+            fetch_announcements=get_announcements,
+            fetch_historical=historical_valuation,
+            gemini_api_key=os.environ.get("GEMINI_API_KEY", ""),
+            data_dir=os.path.dirname(os.path.abspath(__file__)),
+            max_candidates=int(os.environ.get("DISCOVERY_MAX_CANDIDATES", "60")),
+        )
+        init_discovery(app, _discovery_deps)
+        print("[ROBU] Discovery Engine mounted at /discovery")
+    except Exception as _disc_err:
+        print(f"[ROBU] Discovery Engine NOT mounted: {_disc_err}")
+else:
+    print("[ROBU] Discovery Engine disabled (set DISCOVERY_ENABLED=true to enable)")
