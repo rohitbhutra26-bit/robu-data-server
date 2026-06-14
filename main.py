@@ -1634,6 +1634,17 @@ def company_v2(symbol: str):
 
     # ── 1. Screener.in — all fundamentals ────────────────────────────────────
     soup = _fetch_screener_page(symbol)
+
+    # BSE-only stocks: Screener's URL slug is the numeric scrip code, not the
+    # alphanumeric sid (e.g. /company/543971/ works, /company/BONDADA/ 404s).
+    # When the sid lookup misses, retry with the code so we get full, correct
+    # fundamentals instead of falling through to the junk Yahoo path.
+    if not soup and exchange == "BSE":
+        code = str(stock_meta.get("bseCode") or stock_meta.get("bse_code") or "").strip()
+        if code and code != symbol:
+            print(f"[company-v2] {symbol}: retrying Screener via BSE code {code}")
+            soup = _fetch_screener_page(code)
+
     if not soup:
         # Screener.in doesn't have this company (e.g. TATAMOTORS returns 404 on Screener).
         print(f"[company-v2] Screener returned None for {symbol} — using EOD bhavcopy / Yahoo fallback")
