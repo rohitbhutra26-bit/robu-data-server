@@ -969,6 +969,178 @@ def _bhavcopy_price(symbol: str) -> dict | None:
 
 
 # ---------------------------------------------------------------------------
+# BSE Bhavcopy — official EOD price feed for BSE-listed stocks
+# ---------------------------------------------------------------------------
+# NSE Bhavcopy never covers BSE-only stocks, and Yahoo/Screener frequently
+# return junk for them (wrong scrip match → 8x-off price + garbage name).
+# BSE publishes a daily "UDiFF" common-format bhavcopy CSV. We download it once
+# per day and key every row by BOTH scrip code (FinInstrmId) and ticker
+# (TckrSymb), so a lookup works whether we have the numeric code or the symbol.
+# Columns: FinInstrmId, ISIN, TckrSymb, FinInstrmNm, OpnPric, HghPric, LwPric,
+#          ClsPric, PrvsClsgPric, FinInstrmTp (STK = equity).
+# URL: https://www.bseindia.com/download/BhavCopy/Equity/BhavCopy_BSE_CM_0_0_0_<YYYYMMDD>_F_0000.CSV
+# ---------------------------------------------------------------------------
+
+_BSE_BHAVCOPY: dict[str, dict] = {}   # code|symbol → {close, prevClose, open, high, low, name}
+_BSE_BHAVCOPY_DATE: str = ""          # YYYYMMDD of last successful load
+_BSE_BHAVCOPY_LOCK = False
+
+
+def _refresh_bse_bhavcopy() -> None:
+    """Download the most recent BSE UDiFF bhavcopy and cache all EOD prices."""
+    global _BSE_BHAVCOPY, _BSE_BHAVCOPY_DATE, _BSE_BHAVCOPY_LOCK
+
+    today = datetime.now()
+    today_str = today.strftime("%Y%m%d")
+    if _BSE_BHAVCOPY_DATE == today_str and _BSE_BHAVCOPY:
+        return
+    if _BSE_BHAVCOPY_LOCK:
+        return
+
+    _BSE_BHAVCOPY_LOCK = True
+    try:
+        # BSE blocks many datacenter IPs — prime a browser-like session first.
+        if _CURL_AVAILABLE:
+            sess = cffi_requests.Session(impersonate="chrome120")
+        else:
+            sess = requests.Session()
+            sess.headers.update({
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                              "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            })
+        try:
+            sess.get("https://www.bseindia.com", timeout=15)
+        except Exception:
+            pass
+
+        # Try the last 7 calendar days (handles weekends + holidays)
+        for delta in range(7):
+            d = today - timedelta(days=delta)
+            ds = d.strftime("%Y%m%d")
+            url = (f"https://www.bseindia.com/download/BhavCopy/Equity/"
+                   f"BhavCopy_BSE_CM_0_0_0_{ds}_F_0000.CSV")
+            try:
+                resp = sess.get(url, headers={
+                    "Referer": "https://www.bseindia.com/market-data.html",
+                    "Accept": "*/*",
+                }, timeout=30)
+                ctype = resp.headers.get("content-type", "").lower()
+                # A real bhavcopy is ~800KB CSV; the "not found" page is small HTML.
+                if resp.status_code != 200 or len(resp.content) < 50000 or "html" in ctype:
+                    continue
+
+                lines = resp.text.strip().split("\n")
+                if len(lines) < 100:
+                    continue
+                header = [h.strip() for h in lines[0].split(",")]
+                if "FinInstrmId" not in header or "ClsPric" not in header:
+                    continue  # Unrecognised format
+
+                def col(name: str) -> int:
+                    return header.index(name) if name in header else -1
+
+                i_code  = col("FinInstrmId")
+                i_sym   = col("TckrSymb")
+                i_type  = col("FinInstrmTp")
+                i_name  = col("FinInstrmNm")
+                i_open  = col("OpnPric")
+                i_high  = col("HghPric")
+                i_low   = col("LwPric")
+                i_close = col("ClsPric")
+                i_prev  = col("PrvsClsgPric")
+
+                new_cache: dict[str, dict] = {}
+                for line in lines[1:]:
+                    p = line.split(",")
+                    if len(p) <= max(i_code, i_close):
+                        continue
+                    if i_type >= 0 and p[i_type].strip().upper() != "STK":
+                        continue  # equities only — skip derivatives etc.
+                    code = p[i_code].strip()
+                    sym  = p[i_sym].strip().upper() if i_sym >= 0 else ""
+                    try:
+                        def num(idx: int) -> float:
+                            return float(p[idx]) if idx >= 0 and p[idx].strip() else 0.0
+                        rec = {
+                            "close":     num(i_close),
+                            "prevClose": num(i_prev),
+                            "open":      num(i_open),
+                            "high":      num(i_high),
+                            "low":       num(i_low),
+                            "name":      p[i_name].strip() if i_name >= 0 else "",
+                        }
+                    except (ValueError, IndexError):
+                        continue
+                    if rec["close"] <= 0:
+                        continue
+                    if code:
+                        new_cache[code] = rec
+                    if sym:
+                        new_cache[sym] = rec
+
+                if len(new_cache) > 1000:
+                    _BSE_BHAVCOPY = new_cache
+                    _BSE_BHAVCOPY_DATE = today_str  # mark loaded so we don't re-fetch today
+                    print(f"[BSE Bhavcopy] Loaded {len(new_cache)} entries from BSE ({ds})")
+                    return
+            except Exception as e:
+                print(f"[BSE Bhavcopy] Error fetching {ds}: {e}")
+
+        print("[BSE Bhavcopy] Could not load data for last 7 days")
+    finally:
+        _BSE_BHAVCOPY_LOCK = False
+
+
+def _bse_bhavcopy_price(symbol: str) -> dict | None:
+    """Return BSE Bhavcopy price dict for a symbol, or None if unavailable.
+    Resolves the BSE scrip code from the universe, then falls back to the bare
+    symbol / numeric code so it works for sids (BONDADA) and codes (543971)."""
+    _refresh_bse_bhavcopy()
+    if not _BSE_BHAVCOPY:
+        return None
+    info = STOCK_UNIVERSE.get(symbol, {})
+    bare = symbol.upper().replace(".BO", "").replace(".NS", "")
+    candidates = [
+        str(info.get("bseCode") or info.get("bse_code") or "").strip(),
+        bare,
+    ]
+    for key in candidates:
+        if key and key in _BSE_BHAVCOPY:
+            return _BSE_BHAVCOPY[key]
+    return None
+
+
+def _company_from_bhav(symbol: str, bhav: dict, stock_meta: dict, source: str) -> dict:
+    """Build a company-v2 record from an EOD bhavcopy row when fundamentals
+    aren't available (Screener/Yahoo missing). Price + name are correct;
+    ratio fields are 0 and the frontend degrades gracefully."""
+    p  = bhav["close"]
+    pc = bhav.get("prevClose", 0)
+    chg     = round(p - pc, 2) if pc else 0.0
+    chg_pct = round((chg / pc) * 100, 2) if pc else 0.0
+    return {
+        "symbol":        symbol,
+        "name":          bhav.get("name") or stock_meta.get("name", symbol),
+        "sector":        stock_meta.get("sector", "Unknown"),
+        "industry":      "",
+        "exchange":      stock_meta.get("exchange", "NSE"),
+        "currentPrice":  round(p, 2),
+        "previousClose": round(pc, 2),
+        "change":        chg,
+        "changePct":     chg_pct,
+        "marketCap":     0.0,
+        "pe":            0.0, "forwardPE": 0.0, "pb": 0.0,
+        "roe":           0.0, "roa":       0.0, "roce": 0.0,
+        "eps":           0.0, "dividendYield": 0.0,
+        "week52High":    0.0, "week52Low": 0.0,
+        "debtToEquity":  0.0, "bookValue": 0.0,
+        "currentRatio":  0.0, "shares":    0.0,
+        "beta":          0.0, "revenueGrowth": 0.0, "earningsGrowth": 0.0,
+        "dataSource":    source,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -1464,41 +1636,28 @@ def company_v2(symbol: str):
     soup = _fetch_screener_page(symbol)
     if not soup:
         # Screener.in doesn't have this company (e.g. TATAMOTORS returns 404 on Screener).
-        # Fallback chain: Yahoo Finance → NSE Bhavcopy + universe static data.
-        print(f"[company-v2] Screener returned None for {symbol} — trying Yahoo Finance fallback")
+        print(f"[company-v2] Screener returned None for {symbol} — using EOD bhavcopy / Yahoo fallback")
+
+        # BSE-only stocks: the Yahoo fallback returns junk (wrong scrip match →
+        # 8x-off price + garbage name like "543971.BO,0P0001RHEK,..."), so the
+        # official BSE Bhavcopy is authoritative for price AND name here.
+        if exchange == "BSE":
+            bhav = _bse_bhavcopy_price(symbol) or _bhavcopy_price(symbol)
+            if bhav and bhav.get("close", 0) > 0:
+                result = _company_from_bhav(symbol, bhav, stock_meta, "bse-bhavcopy")
+                _cache_set(cache_key, result)
+                return result
+
+        # NSE stocks (or BSE with no bhavcopy yet): Yahoo Finance gives full
+        # fundamentals, then NSE/BSE Bhavcopy as a last-resort price-only record.
         try:
             return company(symbol)   # v1 Yahoo Finance path (handles its own caching)
         except Exception as yf_err:
             print(f"[company-v2] Yahoo also failed for {symbol}: {yf_err}")
-            # Last resort: return price from Bhavcopy + static metadata from STOCK_UNIVERSE.
-            # Ratio fields (PE, ROE, etc.) will be 0 — frontend degrades gracefully.
-            bhav = _bhavcopy_price(symbol)
+            bhav = _bhavcopy_price(symbol) or _bse_bhavcopy_price(symbol)
             if not bhav or bhav.get("close", 0) == 0:
                 raise HTTPException(404, f"No data for {symbol}: Screener not indexed, Yahoo: {yf_err}")
-            p  = bhav["close"]
-            pc = bhav.get("prevClose", 0)
-            chg     = round(p - pc, 2) if pc else 0.0
-            chg_pct = round((chg / pc) * 100, 2) if pc else 0.0
-            result = {
-                "symbol":        symbol,
-                "name":          stock_meta.get("name", symbol),
-                "sector":        stock_meta.get("sector", "Unknown"),
-                "industry":      "",
-                "exchange":      stock_meta.get("exchange", "NSE"),
-                "currentPrice":  p,
-                "previousClose": pc,
-                "change":        chg,
-                "changePct":     chg_pct,
-                "marketCap":     0.0,
-                "pe":            0.0, "forwardPE": 0.0, "pb": 0.0,
-                "roe":           0.0, "roa":       0.0, "roce": 0.0,
-                "eps":           0.0, "dividendYield": 0.0,
-                "week52High":    0.0, "week52Low": 0.0,
-                "debtToEquity":  0.0, "bookValue": 0.0,
-                "currentRatio":  0.0, "shares":    0.0,
-                "beta":          0.0, "revenueGrowth": 0.0, "earningsGrowth": 0.0,
-                "dataSource":    "bhavcopy+universe",
-            }
+            result = _company_from_bhav(symbol, bhav, stock_meta, "bhavcopy+universe")
             _cache_set(cache_key, result)
             return result
 
@@ -1514,8 +1673,14 @@ def company_v2(symbol: str):
         if title:
             screener_name = title.get_text(strip=True).split("|")[0].strip()
 
-    # ── 2. NSE Bhavcopy — official EOD price + change ─────────────────────────
-    bhav = _bhavcopy_price(symbol)
+    # ── 2. Official EOD price + change ────────────────────────────────────────
+    # BSE-only stocks → BSE Bhavcopy (NSE Bhavcopy never covers them, and
+    # Screener's price for BSE scrips is frequently a wrong-scrip mismatch).
+    # NSE stocks → NSE Bhavcopy.
+    if exchange == "BSE":
+        bhav = _bse_bhavcopy_price(symbol) or _bhavcopy_price(symbol)
+    else:
+        bhav = _bhavcopy_price(symbol)
 
     if bhav and bhav.get("close", 0) > 0:
         price_val  = bhav["close"]
@@ -1583,6 +1748,7 @@ def company_v2(symbol: str):
 
     name = (
         screener_name
+        or (bhav.get("name") if bhav else "")
         or stock_meta.get("name", "")
         or symbol
     )
@@ -1712,7 +1878,23 @@ def price(symbol: str):
     if cached is not None:
         return cached
 
-    # 1) Live intraday (handles both NSE and BSE-only stocks)
+    _ns, exchange = _resolve_ticker(symbol)
+
+    # 0) BSE-only stocks: official BSE Bhavcopy EOD close FIRST. Yahoo intraday
+    #    returns junk for BSE scrips (wrong match → 8x-off price), and the user
+    #    needs an accurate price to trade on, not a fast wrong one.
+    if exchange == "BSE":
+        bse = _bse_bhavcopy_price(symbol)
+        if bse and bse.get("close", 0) > 0:
+            p = bse["close"]; pc = bse.get("prevClose", 0)
+            chg = round(p - pc, 2) if pc else 0.0
+            chg_pct = round((chg / pc) * 100, 2) if pc else 0.0
+            result = {"symbol": symbol, "price": p, "change": chg, "changePct": chg_pct,
+                      "prevClose": pc, "source": "bse-bhavcopy"}
+            _cache_set(cache_key, result)
+            return result
+
+    # 1) Live intraday (NSE; also BSE as a fallback if Bhavcopy missed)
     live = _yf_intraday_price(symbol)
     if live:
         result = {"symbol": symbol, **live, "source": "live"}
