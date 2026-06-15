@@ -1385,6 +1385,20 @@ def search(q: str = ""):
     return local[:20]
 
 
+
+def _pick_ceo(officers):
+    """Best-guess current CEO/MD name from Yahoo assetProfile.companyOfficers."""
+    if not officers or not isinstance(officers, list):
+        return ""
+    for kw in ("chief executive", "ceo", "managing director", "chairman & md", " md"):
+        for o in officers:
+            if kw in str(o.get("title", "")).lower() and o.get("name"):
+                return str(o.get("name")).strip()
+    for o in officers:
+        if o.get("name"):
+            return str(o.get("name")).strip()
+    return ""
+
 @app.get("/company/{symbol}")
 def company(symbol: str):
     """Return key company metrics — direct Yahoo Finance API via curl_cffi."""
@@ -1443,6 +1457,10 @@ def company(symbol: str):
         "name": rv(pr, "longName") or rv(pr, "shortName") or stock_meta.get("name", symbol),
         "sector": ap.get("sector") or stock_meta.get("sector", "Unknown"),
         "industry": ap.get("industry", ""),
+        "description": (ap.get("longBusinessSummary") or "").strip(),
+        "ceo": _pick_ceo(ap.get("companyOfficers")),
+        "website": ap.get("website", "") or "",
+        "employees": ap.get("fullTimeEmployees") or 0,
         "exchange": resolved_exchange,
         "currentPrice": price_val,
         "previousClose": prev_close,
