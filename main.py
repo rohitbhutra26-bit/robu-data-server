@@ -1783,7 +1783,10 @@ def company_v2(symbol: str):
     last_eps      = latest_fin.get("eps", 0.0) or 0.0
     # Distressed = making losses OR negative net worth (owes more than it owns).
     # For such names a P/E built off a single good year is misleading.
-    distressed    = latest_pat < 0 or latest_equity < 0
+    # Screener's reported Book Value is the most reliable negative-net-worth signal
+    # (a distressed firm can still post a one-off positive PAT year). For such names
+    # a P/E built off a single good year is misleading.
+    distressed    = latest_pat < 0 or latest_equity < 0 or ratios.get("bookValue", 0.0) < 0
 
     # Screener's top-ratios box rarely includes D/E → compute from the
     # balance sheet: Borrowings ÷ (Equity Capital + Reserves), latest year.
