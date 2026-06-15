@@ -1834,10 +1834,24 @@ def company_v2(symbol: str):
     # Plain-English business description for the "About the company" card.
     description = _parse_screener_about(soup)
 
+    # Enrich from Yahoo assetProfile: Screener doesn't expose the CEO, and its
+    # "About" block is often empty — Yahoo's longBusinessSummary + companyOfficers
+    # fill both so the "About the company" card always has real content.
+    ceo = ""
+    try:
+        _yns, _ = _resolve_ticker(symbol)
+        _ap = _yf_summary(_yns, "assetProfile").get("assetProfile", {}) or {}
+        ceo = _pick_ceo(_ap.get("companyOfficers"))
+        if not description:
+            description = (_ap.get("longBusinessSummary") or "").strip()
+    except Exception as _e:
+        print(f"[company-v2] assetProfile enrich skipped for {symbol}: {_e}")
+
     result = {
         "symbol":         symbol,
         "name":           name,
         "description":    description,
+        "ceo":            ceo,
         "sector":         sector,
         "industry":       industry,
         # Use the exchange resolved up-front (handles BSE-only scrips correctly);
