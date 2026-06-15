@@ -2192,6 +2192,7 @@ def historical_valuation(symbol: str):
         raise HTTPException(500, f"Could not find Screener company ID for {symbol}")
 
     print(f"[historical] {symbol}: Screener company_id={company_id}")
+    src = "screener"
 
     # ── 2. Fetch historical series from Screener chart API ────────────────
     pe_data    = _fetch_screener_chart_api(company_id, "Price-to-Earning", 1825)
@@ -2232,7 +2233,40 @@ def historical_valuation(symbol: str):
             })
 
     if not points:
-        raise HTTPException(404, f"No historical data from Screener chart API for {symbol}")
+        # Screener's chart API is unavailable (moved behind login / changed). Reconstruct a
+        # P/E history from annual EPS × monthly price (Yahoo) so the "cheap vs its own past"
+        # band still works without that endpoint.
+        try:
+            ticker, _ = _resolve_ticker(symbol)
+            try:
+                chart = _yf_chart(ticker, rng="6y", interval="1mo")
+            except HTTPException:
+                alt = ticker.replace(".NS", ".BO") if ticker.endswith(".NS") else ticker.replace(".BO", ".NS")
+                chart = _yf_chart(alt, rng="6y", interval="1mo")
+            ts     = chart.get("timestamp") or []
+            closes = (((chart.get("indicators") or {}).get("quote") or [{}])[0] or {}).get("close") or []
+            recon = []
+            for i, t_ in enumerate(ts):
+                c = closes[i] if i < len(closes) else None
+                if not c:
+                    continue
+                gm = time.gmtime(int(t_))
+                fy_end = gm.tm_year + 1 if gm.tm_mon >= 4 else gm.tm_year
+                eps = eps_by_fy.get(f"FY{fy_end % 100:02d}")
+                pe  = (c / eps) if eps and eps > 0 else None
+                if pe is not None and (pe <= 0 or pe > 500):
+                    pe = None
+                recon.append({"date": f"{gm.tm_year:04d}-{gm.tm_mon:02d}", "price": round(float(c), 2),
+                              "pe": round(pe, 1) if pe else None, "pb": None})
+            points = [p for p in recon if p["pe"] is not None or p["price"] is not None]
+            if points:
+                src = "reconstructed"
+                print(f"[historical] {symbol}: reconstructed {len(points)} points from EPS×price ✓")
+        except Exception as e:
+            print(f"[historical] reconstruction failed for {symbol}: {e}")
+
+    if not points:
+        raise HTTPException(404, f"No historical data for {symbol}")
 
     # ── 5. Statistics ─────────────────────────────────────────────────────
     def _stats(vals: list) -> dict:
@@ -2260,7 +2294,7 @@ def historical_valuation(symbol: str):
             "pe": _stats(pe_vals),
             "pb": _stats(pb_vals),
         },
-        "source": "screener",
+        "source": src,
         "company_id": company_id,
     }
     _cache_set(cache_key, result)
