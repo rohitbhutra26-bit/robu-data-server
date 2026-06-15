@@ -272,6 +272,28 @@ def _cr(val_str: str) -> float:
         return 0.0
 
 
+def _parse_screener_about(soup: Any) -> str:
+    """Extract the plain-English business description (Screener's 'About' block).
+    Falls back to the page meta description. Returns '' if nothing usable."""
+    try:
+        # Screener renders the description inside the company profile block.
+        el = (soup.select_one(".company-profile .about")
+              or soup.select_one("div.about")
+              or soup.select_one(".company-profile p"))
+        if el:
+            txt = el.get_text(" ", strip=True)
+            txt = re.sub(r"\[+\s*\d+\s*\]+", "", txt)        # drop [1] / [[1]] citation markers
+            txt = re.sub(r"\s*Read More\s*$", "", txt).strip()
+            if len(txt) >= 40:
+                return txt[:1200]
+        meta = soup.find("meta", {"name": "description"})
+        if meta and meta.get("content"):
+            return str(meta["content"]).strip()[:1200]
+    except Exception:
+        pass
+    return ""
+
+
 def _parse_screener_ratios(soup: Any) -> dict:
     """
     Extract key ratios from Screener.in #top-ratios section.
@@ -868,23 +890,30 @@ def _cache_set(key: str, data: Any) -> None:
 # ---------------------------------------------------------------------------
 
 _BHAVCOPY: dict[str, dict] = {}   # symbol → {close, prevClose, open, high, low}
-_BHAVCOPY_DATE: str = ""          # DDMMYYYY of last successful load
+_BHAVCOPY_DATE: str = ""          # DDMMYYYY of the ACTUAL day whose file we loaded
 _BHAVCOPY_LOCK = False            # simple flag to prevent concurrent downloads
+_BHAVCOPY_LAST_TRY = 0.0          # epoch of last download attempt (throttle retries)
 
 
 def _refresh_bhavcopy() -> None:
     """Download the most recent NSE Bhavcopy CSV and cache all prices."""
-    global _BHAVCOPY, _BHAVCOPY_DATE, _BHAVCOPY_LOCK
+    global _BHAVCOPY, _BHAVCOPY_DATE, _BHAVCOPY_LOCK, _BHAVCOPY_LAST_TRY
 
     today = datetime.now()
     today_str = today.strftime("%d%m%Y")
 
     if _BHAVCOPY_DATE == today_str and _BHAVCOPY:
-        return   # Already loaded today
+        return   # Already have TODAY'S file — nothing newer to fetch
+    # We only have an older day's file (e.g. fetched before NSE published today's
+    # ~6pm). Keep serving it but retry periodically so we pick up today's close
+    # once it's available — without hammering NSE on every request.
+    if _BHAVCOPY and (time.time() - _BHAVCOPY_LAST_TRY) < 1800:
+        return
     if _BHAVCOPY_LOCK:
         return   # Another request is loading it
 
     _BHAVCOPY_LOCK = True
+    _BHAVCOPY_LAST_TRY = time.time()
     try:
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -949,7 +978,7 @@ def _refresh_bhavcopy() -> None:
 
                 if len(new_cache) > 500:
                     _BHAVCOPY = new_cache
-                    _BHAVCOPY_DATE = today_str  # mark as today so we don't re-fetch
+                    _BHAVCOPY_DATE = ds  # ACTUAL day loaded — if it's not today, we'll retry later
                     print(f"[Bhavcopy] Loaded {len(_BHAVCOPY)} stocks from NSE ({ds})")
                     return
 
@@ -982,22 +1011,27 @@ def _bhavcopy_price(symbol: str) -> dict | None:
 # ---------------------------------------------------------------------------
 
 _BSE_BHAVCOPY: dict[str, dict] = {}   # code|symbol → {close, prevClose, open, high, low, name}
-_BSE_BHAVCOPY_DATE: str = ""          # YYYYMMDD of last successful load
+_BSE_BHAVCOPY_DATE: str = ""          # YYYYMMDD of the ACTUAL day whose file we loaded
 _BSE_BHAVCOPY_LOCK = False
+_BSE_BHAVCOPY_LAST_TRY = 0.0          # epoch of last download attempt (throttle retries)
 
 
 def _refresh_bse_bhavcopy() -> None:
     """Download the most recent BSE UDiFF bhavcopy and cache all EOD prices."""
-    global _BSE_BHAVCOPY, _BSE_BHAVCOPY_DATE, _BSE_BHAVCOPY_LOCK
+    global _BSE_BHAVCOPY, _BSE_BHAVCOPY_DATE, _BSE_BHAVCOPY_LOCK, _BSE_BHAVCOPY_LAST_TRY
 
     today = datetime.now()
     today_str = today.strftime("%Y%m%d")
     if _BSE_BHAVCOPY_DATE == today_str and _BSE_BHAVCOPY:
+        return  # have today's file
+    # Only have an older day's file — retry periodically (throttled) for today's.
+    if _BSE_BHAVCOPY and (time.time() - _BSE_BHAVCOPY_LAST_TRY) < 1800:
         return
     if _BSE_BHAVCOPY_LOCK:
         return
 
     _BSE_BHAVCOPY_LOCK = True
+    _BSE_BHAVCOPY_LAST_TRY = time.time()
     try:
         # BSE blocks many datacenter IPs — prime a browser-like session first.
         if _CURL_AVAILABLE:
@@ -1080,7 +1114,7 @@ def _refresh_bse_bhavcopy() -> None:
 
                 if len(new_cache) > 1000:
                     _BSE_BHAVCOPY = new_cache
-                    _BSE_BHAVCOPY_DATE = today_str  # mark loaded so we don't re-fetch today
+                    _BSE_BHAVCOPY_DATE = ds  # ACTUAL day loaded — if not today, we'll retry later
                     print(f"[BSE Bhavcopy] Loaded {len(new_cache)} entries from BSE ({ds})")
                     return
             except Exception as e:
@@ -1736,40 +1770,52 @@ def company_v2(symbol: str):
     roce        = ratios.get("roce", 0.0)
     de          = ratios.get("debtToEquity", 0.0)
 
+    # Parse the financial-year rows once — reused for D/E, EPS/PE and the
+    # distress check below.
+    try:
+        fin_rows = _parse_screener_financials(soup)
+    except Exception as fin_err:
+        print(f"[company-v2] financials parse failed for {symbol}: {fin_err}")
+        fin_rows = []
+    latest_fin    = fin_rows[-1] if fin_rows else {}
+    latest_pat    = latest_fin.get("pat", 0.0) or 0.0
+    latest_equity = latest_fin.get("equity", 0.0) or 0.0
+    last_eps      = latest_fin.get("eps", 0.0) or 0.0
+    # Distressed = making losses OR negative net worth (owes more than it owns).
+    # For such names a P/E built off a single good year is misleading.
+    distressed    = latest_pat < 0 or latest_equity < 0
+
     # Screener's top-ratios box rarely includes D/E → compute from the
     # balance sheet: Borrowings ÷ (Equity Capital + Reserves), latest year.
     if not de:
-        try:
-            fin_rows = _parse_screener_financials(soup)
-            for row in reversed(fin_rows):
-                borrow = row.get("borrowings", 0.0)
-                equity = row.get("equity", 0.0)
-                if equity > 0:
-                    de = round(borrow / equity, 2)
-                    break
-        except Exception as de_err:
-            print(f"[company-v2] D/E from balance sheet failed for {symbol}: {de_err}")
+        for row in reversed(fin_rows):
+            borrow = row.get("borrowings", 0.0)
+            equity = row.get("equity", 0.0)
+            if equity > 0:
+                de = round(borrow / equity, 2)
+                break
     div_yield   = ratios.get("dividendYield", 0.0)
     book_value  = ratios.get("bookValue", 0.0)
     w52_high    = ratios.get("week52High", 0.0)
     w52_low     = ratios.get("week52Low", 0.0)
 
-    # Derive EPS from price / PE (when Screener doesn't give EPS directly)
-    eps = round(price_val / pe, 2) if pe and pe > 0 else 0.0
+    # EPS: prefer the actual reported EPS row (can be negative for loss-makers);
+    # fall back to price/PE only when no financial EPS is available.
+    if last_eps:
+        eps = round(last_eps, 2)
+    elif pe and pe > 0:
+        eps = round(price_val / pe, 2)
+    else:
+        eps = 0.0
 
-    # Screener leaves Stock P/E blank when core/normalized earnings are negative
-    # (e.g. profits driven by exceptional gains). Derive P/E from latest annual
-    # EPS so the frontend shows a real number instead of 0.0x.
-    if (not pe or pe <= 0) and price_val > 0:
-        try:
-            fin_rows = _parse_screener_financials(soup)
-            if fin_rows:
-                last_eps = fin_rows[-1].get("eps", 0.0)
-                if last_eps and last_eps > 0:
-                    pe  = round(price_val / last_eps, 1)
-                    eps = last_eps
-        except Exception:
-            pass
+    # P/E: recompute off the live price + real EPS so it matches today's price.
+    # NEVER manufacture a positive P/E for a distressed (loss-making /
+    # negative-net-worth) company — leave it blank so the frontend honestly
+    # shows "loss-making" instead of a misleadingly cheap multiple.
+    if distressed:
+        pe = 0.0
+    elif last_eps > 0 and price_val > 0:
+        pe = round(price_val / last_eps, 1)
 
     # Sector: prefer Screener's own industry tag, then screener sector, then universe
     sector   = ratios.get("screenerIndustry") or ratios.get("sector") or stock_meta.get("sector", "Unknown")
@@ -1782,12 +1828,18 @@ def company_v2(symbol: str):
         or symbol
     )
 
+    # Plain-English business description for the "About the company" card.
+    description = _parse_screener_about(soup)
+
     result = {
         "symbol":         symbol,
         "name":           name,
+        "description":    description,
         "sector":         sector,
         "industry":       industry,
-        "exchange":       "NSE" if stock_meta.get("exchange", "NSE") != "BSE" else "BSE",
+        # Use the exchange resolved up-front (handles BSE-only scrips correctly);
+        # don't re-derive it from a possibly-thin universe record.
+        "exchange":       exchange,
         "currentPrice":   round(price_val, 2),
         "previousClose":  round(prev_close, 2),
         "change":         change,
@@ -3408,7 +3460,9 @@ def _fetch_twelve_data():
                     if price > 0 or mktcap > 0:
                         updated[sym].update({"price":round(price,2),"marketCap":round(mktcap,1),
                             "pe":round(pe,1) if pe else None,"roe":round(roe,1),
-                            "roce":round(roe*0.9,1),"netMargin":round(margin,1),
+                            # Twelve Data doesn't provide ROCE — don't fabricate it as
+                            # roe*0.9 (ROCE and ROE diverge 2-3x in practice). Leave null.
+                            "roce":None,"netMargin":round(margin,1),
                             "debtToEquity":round(de,2),"revenueGrowth5Y":round(rev_g,1),
                             "dividendYield":round(div_y,2),
                             "score":_compute_score(roe,pe or 0,de,margin)})
