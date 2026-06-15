@@ -382,13 +382,27 @@ def _parse_screener_ratios(soup: Any) -> dict:
         return bool(_re.search(r'^[a-zA-Z0-9\-]+\.[a-zA-Z]{2,6}$', s.strip()))
 
     try:
+        # Modern Screener breadcrumb: <a title="Industry" href="/market/IN08/...">Computers - Software & Consulting</a>
+        crumb = {}
         for a in soup.find_all("a", href=True):
-            href = a.get("href", "")
-            if "/screens/industry/" in href or "/screens/sector/" in href:
+            title = (a.get("title") or "").strip().lower()
+            if title in ("industry", "broad industry", "sector", "broad sector") and "/market/" in a.get("href", ""):
                 label = a.get_text(strip=True)
                 if label and len(label) > 2 and not _looks_like_domain(label):
-                    ratios["screenerIndustry"] = label
-                    break
+                    crumb.setdefault(title, label)
+        for key in ("industry", "broad industry", "sector", "broad sector"):
+            if key in crumb:
+                ratios["screenerIndustry"] = crumb[key]
+                break
+        # Legacy fallback: /screens/industry/ links
+        if "screenerIndustry" not in ratios:
+            for a in soup.find_all("a", href=True):
+                href = a.get("href", "")
+                if "/screens/industry/" in href or "/screens/sector/" in href:
+                    label = a.get_text(strip=True)
+                    if label and len(label) > 2 and not _looks_like_domain(label):
+                        ratios["screenerIndustry"] = label
+                        break
         # Also check the company info section for sector/industry links
         # IMPORTANT: skip website domains (e.g. "ril.com" appears in company-links)
         company_info = soup.find(class_="company-links") or soup.find(class_="sub-links")
@@ -3645,8 +3659,39 @@ def get_announcements(symbol: str, limit: int = 10):
     except Exception as e:
         print(f"[NSE announcements] {symbol}: {e}")
 
-    # Fallback — return empty so frontend handles gracefully
-    return {"symbol": symbol, "announcements": [], "source": "nse", "error": "unavailable"}
+    # Fallback — NSE blocked: parse recent filings from the Screener company page
+    # (BSE corp-filing attachments: announcements + earnings-call transcripts).
+    try:
+        soup = _fetch_screener_page(symbol)
+        if soup:
+            seen: set = set()
+            items = []
+            for a in soup.find_all("a", href=True):
+                href = a["href"]
+                if "xml-data/corpfiling" not in href and "AnnPdfOpen" not in href:
+                    continue
+                txt = a.get_text(" ", strip=True)
+                if not txt or len(txt) < 6 or href in seen:
+                    continue
+                seen.add(href)
+                m = re.search(r"\b(\d{1,2}\s+[A-Z][a-z]{2,8}(?:\s+\d{4})?)\b", txt)
+                items.append({
+                    "date":     m.group(1) if m else "",
+                    "subject":  txt[:220],
+                    "category": "Filing",
+                    "url":      href,
+                })
+                if len(items) >= limit:
+                    break
+            if items:
+                result = {"symbol": symbol, "announcements": items, "source": "screener"}
+                _cache_set(cache_key, result)
+                return result
+    except Exception as e:
+        print(f"[screener announcements] {symbol}: {e}")
+
+    # Nothing available anywhere — return empty so the frontend shows a clean "no data" state
+    return {"symbol": symbol, "announcements": [], "source": "none", "error": "unavailable"}
 
 
 
