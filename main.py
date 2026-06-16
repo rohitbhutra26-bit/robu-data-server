@@ -3911,8 +3911,10 @@ def dividends(symbol: str):
     # 2) Yahoo: last dividend amount (Rs/share) + ex-date + annual rate
     last_amt = annual_rate = 0.0
     last_date = ""
+    yahoo_ok = False
     try:
         sd = _yf_summary(ns, "summaryDetail,defaultKeyStatistics,calendarEvents")
+        yahoo_ok = True
         summ = sd.get("summaryDetail", {}) or {}
         ks   = sd.get("defaultKeyStatistics", {}) or {}
         annual_rate = float(summ.get("dividendRate") or 0) or 0.0
@@ -3925,10 +3927,15 @@ def dividends(symbol: str):
     except Exception as e:
         print(f"[dividends] yahoo {symbol}: {e}")
 
+    available = bool(soup) or yahoo_ok
     pays = bool(div_yield or annual_rate or last_amt or payout_hist)
-    latest_payout = payout_hist[-1]["payoutPct"] if payout_hist else 0.0
+    # Representative payout = median of last 3 non-zero years (avoids partial-year skew)
+    _recent = [p["payoutPct"] for p in payout_hist if p["payoutPct"] > 0][-3:]
+    latest_payout = round(sorted(_recent)[len(_recent)//2], 1) if _recent else 0.0
 
-    if not pays:
+    if not available:
+        plain = "We couldn't find dividend data for this symbol — it may be unlisted or unrecognised."
+    elif not pays:
         plain = ("This company doesn't pay a dividend right now — it reinvests its profits "
                  "back into growing the business instead of paying shareholders.")
     else:
@@ -3944,7 +3951,7 @@ def dividends(symbol: str):
             plain += (f" It returns around {latest_payout:.0f}% of its yearly profit to "
                       "shareholders; the rest is kept to grow the business.")
 
-    result = {"symbol": symbol, "paysDividend": pays,
+    result = {"symbol": symbol, "available": available, "paysDividend": pays and available,
               "dividendYield": round(div_yield, 2), "lastDividend": round(last_amt, 2),
               "lastExDate": last_date, "annualRate": round(annual_rate, 2),
               "payoutRatioPct": latest_payout, "payoutHistory": payout_hist,
