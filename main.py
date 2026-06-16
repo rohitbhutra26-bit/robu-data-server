@@ -2218,6 +2218,15 @@ def historical_valuation(symbol: str):
     fin_data = _parse_screener_financials(soup)
     # Build EPS map: {"FY24": 45.2, ...}
     eps_by_fy = {row["year"]: row["eps"] for row in fin_data if row.get("eps", 0) > 0}
+    # Build book-value-per-share map for P/B reconstruction.
+    # shares (Cr) = PAT (Cr) / EPS (Rs)  →  BVPS (Rs) = equity (Cr) / shares (Cr) = equity * EPS / PAT
+    bvps_by_fy = {}
+    for row in fin_data:
+        eps_r = row.get("eps", 0) or 0
+        pat_r = row.get("pat", 0) or 0
+        eq_r  = row.get("equity", 0) or 0
+        if eps_r > 0 and pat_r > 0 and eq_r > 0:
+            bvps_by_fy[row["year"]] = (eq_r * eps_r) / pat_r
 
     # ── 4. Unify into monthly points ─────────────────────────────────────
     pe_map    = {d["date"]: d["value"] for d in pe_data}
@@ -2259,6 +2268,22 @@ def historical_valuation(symbol: str):
                 chart = _yf_chart(alt, rng="6y", interval="1mo")
             ts     = chart.get("timestamp") or []
             closes = (((chart.get("indicators") or {}).get("quote") or [{}])[0] or {}).get("close") or []
+            # Latest FY we actually have, for carry-forward on the most recent months
+            # (current-FY results aren't published yet, so reuse the newest known EPS/BVPS).
+            eps_fys  = [int(k[2:]) for k in eps_by_fy  if k.startswith("FY") and k[2:].isdigit()]
+            bvps_fys = [int(k[2:]) for k in bvps_by_fy if k.startswith("FY") and k[2:].isdigit()]
+            latest_eps_fy  = max(eps_fys)  if eps_fys  else None
+            latest_bvps_fy = max(bvps_fys) if bvps_fys else None
+
+            def _carry(by_fy, fy2, latest_fy):
+                """Exact FY if present; else carry the latest known value forward for recent months."""
+                v = by_fy.get(f"FY{fy2:02d}")
+                if v is not None:
+                    return v
+                if latest_fy is not None and fy2 >= latest_fy:
+                    return by_fy.get(f"FY{latest_fy:02d}")
+                return None
+
             recon = []
             for i, t_ in enumerate(ts):
                 c = closes[i] if i < len(closes) else None
@@ -2266,13 +2291,18 @@ def historical_valuation(symbol: str):
                     continue
                 gm = time.gmtime(int(t_))
                 fy_end = gm.tm_year + 1 if gm.tm_mon >= 4 else gm.tm_year
-                eps = eps_by_fy.get(f"FY{fy_end % 100:02d}")
-                pe  = (c / eps) if eps and eps > 0 else None
+                fy2 = fy_end % 100
+                eps  = _carry(eps_by_fy,  fy2, latest_eps_fy)
+                bvps = _carry(bvps_by_fy, fy2, latest_bvps_fy)
+                pe  = (c / eps)  if eps  and eps  > 0 else None
+                pb  = (c / bvps) if bvps and bvps > 0 else None
                 if pe is not None and (pe <= 0 or pe > 500):
                     pe = None
+                if pb is not None and (pb <= 0 or pb > 100):
+                    pb = None
                 recon.append({"date": f"{gm.tm_year:04d}-{gm.tm_mon:02d}", "price": round(float(c), 2),
-                              "pe": round(pe, 1) if pe else None, "pb": None})
-            points = [p for p in recon if p["pe"] is not None or p["price"] is not None]
+                              "pe": round(pe, 1) if pe else None, "pb": round(pb, 2) if pb else None})
+            points = [p for p in recon if p["pe"] is not None or p["pb"] is not None or p["price"] is not None]
             if points:
                 src = "reconstructed"
                 print(f"[historical] {symbol}: reconstructed {len(points)} points from EPS×price ✓")
