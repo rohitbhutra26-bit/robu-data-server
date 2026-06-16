@@ -3726,6 +3726,294 @@ def get_announcements(symbol: str, limit: int = 10):
 
 
 # ===========================================================================
+# Profile extras — Dividend history, Shareholding pattern, Analyst view  (M1)
+#   /dividends/{symbol}     — last dividend + yield + payout history (plain English)
+#   /shareholding/{symbol}  — promoter / FII / DII / public split (Screener)
+#   /analyst/{symbol}       — ratings + target price (Yahoo)
+# All degrade gracefully to a clean "not available" payload for thin coverage.
+# ===========================================================================
+
+def _fmt_unix_date(ts) -> str:
+    """Yahoo returns dates as unix seconds when formatted=false -> 'YYYY-MM-DD' or ''."""
+    try:
+        if not ts:
+            return ""
+        return datetime.utcfromtimestamp(int(ts)).strftime("%Y-%m-%d")
+    except Exception:
+        return ""
+
+
+def _screener_soup_for(symbol: str):
+    """Fetch a Screener page, retrying via BSE code for BSE-only scrips."""
+    stock_meta = STOCK_UNIVERSE.get(symbol, {})
+    _ns, exchange = _resolve_ticker(symbol)
+    soup = _fetch_screener_page(symbol)
+    if not soup and exchange == "BSE":
+        code = str(stock_meta.get("bseCode") or stock_meta.get("bse_code") or "").strip()
+        if code and code != symbol:
+            soup = _fetch_screener_page(code)
+    return soup
+
+
+def _parse_screener_shareholding(soup: Any) -> dict:
+    """Parse Screener's #shareholding quarterly table. {} if absent."""
+    section = soup.find(id="shareholding") if soup else None
+    table = section.find("table") if section else None
+    if not table:
+        return {}
+
+    periods = []
+    thead = table.find("thead")
+    if thead:
+        for th in thead.find_all("th")[1:]:
+            txt = th.get_text(strip=True)
+            if txt:
+                periods.append(txt)
+
+    rows: dict = {}
+    tbody = table.find("tbody")
+    if tbody:
+        for tr in tbody.find_all("tr"):
+            cells = tr.find_all("td")
+            if not cells:
+                continue
+            label = cells[0].get_text(strip=True).lower().rstrip(" +").strip()
+            rows[label] = [_cr(td.get_text(strip=True)) for td in cells[1:len(periods) + 1]]
+
+    if not periods or not rows:
+        return {}
+
+    def _pick(*keys):
+        for k in keys:
+            for label, vals in rows.items():
+                if label.startswith(k):
+                    return vals
+        return []
+
+    promoter = _pick("promoter")
+    fii      = _pick("fii", "foreign")
+    dii      = _pick("dii", "domestic")
+    govt     = _pick("government")
+    public   = _pick("public")
+    holders  = _pick("no. of shareholder", "shareholders")
+
+    n = len(periods)
+    li = n - 1
+
+    def _at(arr, i):
+        return round(arr[i], 2) if arr and i < len(arr) and arr[i] else 0.0
+
+    latest = {
+        "promoter":   _at(promoter, li),
+        "fii":        _at(fii, li),
+        "dii":        _at(dii, li),
+        "government": _at(govt, li),
+        "public":     _at(public, li),
+        "shareholders": int(holders[li]) if holders and li < len(holders) and holders[li] else 0,
+    }
+    accounted = (latest["promoter"] + latest["fii"] + latest["dii"]
+                 + latest["government"] + latest["public"])
+    latest["others"] = round(max(0.0, 100.0 - accounted), 2)
+
+    history = [{
+        "period":   periods[i],
+        "promoter": _at(promoter, i),
+        "fii":      _at(fii, i),
+        "dii":      _at(dii, i),
+        "public":   _at(public, i),
+    } for i in range(n)]
+
+    return {"asOf": periods[li], "latest": latest, "history": history}
+
+
+@app.get("/shareholding/{symbol}")
+def shareholding(symbol: str):
+    symbol = _SYMBOL_REDIRECTS.get(symbol.upper().strip(), symbol.upper().strip())
+    cache_key = f"shareholding:{symbol}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    soup = _screener_soup_for(symbol)
+    data = _parse_screener_shareholding(soup) if soup else {}
+    if not data:
+        result = {"symbol": symbol, "available": False, "source": "none",
+                  "plainEnglish": "Ownership breakdown isn't published for this company yet."}
+        _cache_set(cache_key, result)
+        return result
+
+    pledge = None
+    try:
+        pledge = _parse_screener_ratios(soup).get("pledgedPct")
+    except Exception:
+        pass
+
+    L = data["latest"]
+    prom, fii, dii = L["promoter"], L["fii"], L["dii"]
+    if prom >= 50:
+        own = f"Promoters (the founders/owners) hold a controlling {prom:.0f}%"
+    elif prom > 0:
+        own = f"Promoters hold {prom:.0f}%"
+    else:
+        own = "This company has no promoter holding (it's widely held)"
+    inst = fii + dii
+    plain = f"{own}. Big investors (mutual funds + foreign funds) own about {inst:.0f}%."
+    if pledge:
+        plain += f" Watch out: {pledge:.0f}% of promoter shares are pledged as loan collateral."
+
+    result = {"symbol": symbol, "available": True, "asOf": data["asOf"],
+              "latest": L, "history": data["history"], "pledgePct": pledge,
+              "plainEnglish": plain, "source": "screener"}
+    _cache_set(cache_key, result)
+    return result
+
+
+@app.get("/dividends/{symbol}")
+def dividends(symbol: str):
+    symbol = _SYMBOL_REDIRECTS.get(symbol.upper().strip(), symbol.upper().strip())
+    cache_key = f"dividends:{symbol}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    ns, _exchange = _resolve_ticker(symbol)
+
+    # 1) Screener: yield% + dividend-payout history (% of profit returned)
+    div_yield = 0.0
+    payout_hist: list = []
+    soup = _screener_soup_for(symbol)
+    if soup:
+        try:
+            div_yield = _parse_screener_ratios(soup).get("dividendYield", 0.0) or 0.0
+        except Exception:
+            pass
+        try:
+            section = soup.find(id="profit-loss")
+            table = section.find("table") if section else None
+            if table:
+                years = []
+                head = table.find("thead")
+                for th in (head.find_all("th")[1:] if head else []):
+                    m = re.search(r"(\d{4})", th.get_text(strip=True))
+                    years.append(f"FY{m.group(1)[2:]}" if m else "")
+                body = table.find("tbody")
+                for tr in (body.find_all("tr") if body else []):
+                    cells = tr.find_all("td")
+                    if cells and "dividend payout" in cells[0].get_text(strip=True).lower():
+                        for i, td in enumerate(cells[1:len(years) + 1]):
+                            if i < len(years) and years[i]:
+                                payout_hist.append({"year": years[i],
+                                                    "payoutPct": round(_cr(td.get_text(strip=True)), 1)})
+                        break
+        except Exception as e:
+            print(f"[dividends] payout parse {symbol}: {e}")
+
+    # 2) Yahoo: last dividend amount (Rs/share) + ex-date + annual rate
+    last_amt = annual_rate = 0.0
+    last_date = ""
+    try:
+        sd = _yf_summary(ns, "summaryDetail,defaultKeyStatistics,calendarEvents")
+        summ = sd.get("summaryDetail", {}) or {}
+        ks   = sd.get("defaultKeyStatistics", {}) or {}
+        annual_rate = float(summ.get("dividendRate") or 0) or 0.0
+        if not div_yield and summ.get("dividendYield"):
+            div_yield = round(float(summ["dividendYield"]) * 100, 2)
+        last_amt  = float(ks.get("lastDividendValue") or 0) or 0.0
+        last_date = _fmt_unix_date(ks.get("lastDividendDate") or summ.get("exDividendDate"))
+        if not last_date:
+            last_date = _fmt_unix_date((sd.get("calendarEvents", {}) or {}).get("exDividendDate"))
+    except Exception as e:
+        print(f"[dividends] yahoo {symbol}: {e}")
+
+    pays = bool(div_yield or annual_rate or last_amt or payout_hist)
+    latest_payout = payout_hist[-1]["payoutPct"] if payout_hist else 0.0
+
+    if not pays:
+        plain = ("This company doesn't pay a dividend right now — it reinvests its profits "
+                 "back into growing the business instead of paying shareholders.")
+    else:
+        bits = []
+        if last_amt:
+            bits.append(f"It last paid about Rs {last_amt:.2f} per share")
+        elif annual_rate:
+            bits.append(f"It pays roughly Rs {annual_rate:.2f} per share a year")
+        if div_yield:
+            bits.append(f"that's about {div_yield:.1f}% of today's price (the dividend yield)")
+        plain = (", ".join(bits) if bits else "This company pays a dividend") + "."
+        if latest_payout:
+            plain += (f" It returns around {latest_payout:.0f}% of its yearly profit to "
+                      "shareholders; the rest is kept to grow the business.")
+
+    result = {"symbol": symbol, "paysDividend": pays,
+              "dividendYield": round(div_yield, 2), "lastDividend": round(last_amt, 2),
+              "lastExDate": last_date, "annualRate": round(annual_rate, 2),
+              "payoutRatioPct": latest_payout, "payoutHistory": payout_hist,
+              "plainEnglish": plain, "source": "screener+yahoo"}
+    _cache_set(cache_key, result)
+    return result
+
+
+@app.get("/analyst/{symbol}")
+def analyst(symbol: str):
+    symbol = _SYMBOL_REDIRECTS.get(symbol.upper().strip(), symbol.upper().strip())
+    cache_key = f"analyst:{symbol}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    ns, _exchange = _resolve_ticker(symbol)
+    try:
+        d = _yf_summary(ns, "financialData,recommendationTrend")
+    except Exception as e:
+        print(f"[analyst] yahoo {symbol}: {e}")
+        result = {"symbol": symbol, "available": False, "source": "none",
+                  "plainEnglish": "No analyst coverage available for this company."}
+        _cache_set(cache_key, result)
+        return result
+
+    fd = d.get("financialData", {}) or {}
+    num = int(fd.get("numberOfAnalystOpinions") or 0)
+    target_mean = float(fd.get("targetMeanPrice") or 0) or 0.0
+    if not num and not target_mean:
+        result = {"symbol": symbol, "available": False, "source": "yahoo",
+                  "plainEnglish": "No analyst coverage available for this company."}
+        _cache_set(cache_key, result)
+        return result
+
+    current     = float(fd.get("currentPrice") or 0) or 0.0
+    target_high = float(fd.get("targetHighPrice") or 0) or 0.0
+    target_low  = float(fd.get("targetLowPrice") or 0) or 0.0
+    rec_mean    = float(fd.get("recommendationMean") or 0) or 0.0
+    rec_key     = (fd.get("recommendationKey") or "").replace("_", " ").title()
+    upside = round((target_mean - current) / current * 100, 1) if current and target_mean else 0.0
+
+    dist = {"strongBuy": 0, "buy": 0, "hold": 0, "sell": 0, "strongSell": 0}
+    trend = (d.get("recommendationTrend", {}) or {}).get("trend") or []
+    if trend:
+        t0 = trend[0]
+        dist = {k: int(t0.get(k) or 0) for k in dist}
+
+    label = rec_key or "Hold"
+    if upside > 1:
+        dir_txt = f"about {upside:.0f}% above today's price"
+    elif upside < -1:
+        dir_txt = f"about {abs(upside):.0f}% below today's price"
+    else:
+        dir_txt = "right around today's price"
+    plain = (f"{num} analysts cover this stock. On average they rate it '{label}', "
+             f"with a price target of Rs {target_mean:,.0f} — {dir_txt}.")
+
+    result = {"symbol": symbol, "available": True, "rating": label,
+              "ratingScore": round(rec_mean, 2), "numAnalysts": num,
+              "currentPrice": round(current, 2), "targetMean": round(target_mean, 2),
+              "targetHigh": round(target_high, 2), "targetLow": round(target_low, 2),
+              "upsidePct": upside, "distribution": dist,
+              "plainEnglish": plain, "source": "yahoo"}
+    _cache_set(cache_key, result)
+    return result
+
+
+# ===========================================================================
 # ROBU Discovery Engine — wiring (self-contained package in ./discovery)
 # ---------------------------------------------------------------------------
 # Heavy work runs as a nightly batch inside this package and is stored in
