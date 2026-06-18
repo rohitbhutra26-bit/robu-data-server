@@ -1813,6 +1813,11 @@ def company_v2(symbol: str):
                 break
     div_yield   = ratios.get("dividendYield", 0.0)
     book_value  = ratios.get("bookValue", 0.0)
+    # Screener frequently exposes P/B in the top-ratios but not the Book Value row — derive
+    # book value per share from price / (P/B) so book-based models and the P/B card aren't
+    # blank (~2/3 of stocks were missing it).
+    if book_value <= 0 and pb > 0 and price_val > 0:
+        book_value = round(price_val / pb, 2)
     w52_high    = ratios.get("week52High", 0.0)
     w52_low     = ratios.get("week52Low", 0.0)
 
