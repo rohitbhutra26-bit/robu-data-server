@@ -3928,7 +3928,10 @@ def dividends(symbol: str):
         print(f"[dividends] yahoo {symbol}: {e}")
 
     available = bool(soup) or yahoo_ok
-    pays = bool(div_yield or annual_rate or last_amt or payout_hist)
+    # A non-empty payout history of all-zeros (e.g. a growth co that has never paid) must
+    # NOT count as paying — require a real non-zero signal somewhere.
+    has_payout = any((p.get("payoutPct", 0) or 0) > 0 for p in payout_hist)
+    pays = bool(div_yield or annual_rate or last_amt or has_payout)
     # Representative payout = median of last 3 non-zero years (avoids partial-year skew)
     _recent = [p["payoutPct"] for p in payout_hist if p["payoutPct"] > 0][-3:]
     latest_payout = round(sorted(_recent)[len(_recent)//2], 1) if _recent else 0.0
