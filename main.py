@@ -3188,6 +3188,70 @@ def universe_symbols(offset: int = 0, limit: int = 100):
 
 
 # ── Quarterly Results endpoint ────────────────────────────────────────────────
+# ── Macro: India 10-yr G-sec yield (rate backdrop for the Story/Potential engine) ──
+_macro_cache: dict[str, Any] = {"data": None, "at": 0.0}
+_MACRO_TTL = 12 * 3600  # refresh twice a day
+
+
+def _fetch_india_10y() -> dict | None:
+    """India 10-yr government bond yield from FRED (monthly, OECD-based, no API key).
+    Returns {y10, direction, refLow, refHigh, asOf, source} or None on failure."""
+    url = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=INDIRLTLT01STM"
+    try:
+        r = requests.get(url, timeout=12)
+        if not r.ok:
+            return None
+        lines = [ln for ln in r.text.strip().splitlines() if ln]
+        pts: list[tuple[str, float]] = []
+        for ln in lines[1:]:  # skip header
+            parts = ln.split(",")
+            if len(parts) < 2:
+                continue
+            d, v = parts[0].strip(), parts[1].strip()
+            if v in (".", "", "NaN", "nan"):
+                continue
+            try:
+                pts.append((d, float(v)))
+            except ValueError:
+                continue
+        if len(pts) < 2:
+            return None
+        y10 = pts[-1][1]
+        if not (3.0 < y10 < 12.0):
+            return None
+        prev = pts[-4][1] if len(pts) >= 4 else pts[0][1]  # ~3 readings ago
+        diff = y10 - prev
+        direction = "falling" if diff < -0.05 else "rising" if diff > 0.05 else "flat"
+        recent = [v for _, v in pts[-24:]]
+        return {
+            "y10": round(y10, 2),
+            "direction": direction,
+            "refLow": round(min(recent), 2),
+            "refHigh": round(max(recent), 2),
+            "asOf": pts[-1][0],
+            "source": "FRED INDIRLTLT01STM",
+        }
+    except Exception:
+        return None
+
+
+@app.get("/macro")
+def macro():
+    """India 10-yr yield + direction for the re-rating rate layer.
+    Cached 12h; falls back to a recent constant if the upstream source is down."""
+    now = time.time()
+    cached = _macro_cache.get("data")
+    if cached and (now - _macro_cache.get("at", 0.0)) < _MACRO_TTL:
+        return cached
+    data = _fetch_india_10y()
+    if data is None:
+        data = {"y10": 6.86, "direction": "falling", "refLow": 6.5,
+                "refHigh": 7.4, "asOf": "fallback", "source": "fallback"}
+    _macro_cache["data"] = data
+    _macro_cache["at"] = now
+    return data
+
+
 @app.get("/quarterly/{symbol}")
 def quarterly_results(symbol: str):
     """
