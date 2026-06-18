@@ -3175,6 +3175,18 @@ def universe_size():
     return {"count": len(STOCK_UNIVERSE), "source": "NSE EQUITY_L.csv"}
 
 
+@app.get("/universe/symbols")
+def universe_symbols(offset: int = 0, limit: int = 100):
+    """A stable, sorted slice of the universe's NSE symbols — lets the data-quality scanner
+    sweep a rotating batch each day so the whole universe gets covered over time."""
+    syms = sorted(STOCK_UNIVERSE.keys())
+    total = len(syms)
+    if total == 0:
+        return {"total": 0, "offset": 0, "limit": limit, "symbols": []}
+    off = offset % total
+    return {"total": total, "offset": off, "limit": limit, "symbols": syms[off:off + limit]}
+
+
 # ── Quarterly Results endpoint ────────────────────────────────────────────────
 @app.get("/quarterly/{symbol}")
 def quarterly_results(symbol: str):

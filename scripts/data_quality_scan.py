@@ -62,7 +62,15 @@ def scan(symbols):
 
 if __name__ == "__main__":
     args = sys.argv[1:]
-    if args and args[0] == "--file":
+    if args and args[0] == "--rotate":
+        # daily rotating batch: a different slice of the universe each day → full coverage over time
+        import datetime
+        n = int(args[1]) if len(args) > 1 else 100
+        off = (datetime.date.today().toordinal() * n)
+        u = _fetch(f"/universe/symbols?offset={off}&limit={n}") or {}
+        syms = u.get("symbols", [])
+        print(f"rotating batch: offset {u.get('offset')}/{u.get('total')} ({len(syms)} symbols)")
+    elif args and args[0] == "--file":
         syms = [l.strip() for l in open(args[1]) if l.strip()]
     elif args:
         syms = args
