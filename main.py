@@ -3219,9 +3219,12 @@ def _fetch_india_10y() -> dict | None:
         y10 = pts[-1][1]
         if not (3.0 < y10 < 12.0):
             return None
-        prev = pts[-4][1] if len(pts) >= 4 else pts[0][1]  # ~3 readings ago
+        # Trend over ~6 months with a wide dead-band: this is a MONTHLY, lagged
+        # series, so only a genuine multi-month move (>20bp) counts as a trend —
+        # small wiggles read "flat" rather than flip-flopping the rate tilt.
+        prev = pts[-7][1] if len(pts) >= 7 else pts[0][1]  # ~6 readings ago
         diff = y10 - prev
-        direction = "falling" if diff < -0.05 else "rising" if diff > 0.05 else "flat"
+        direction = "falling" if diff < -0.20 else "rising" if diff > 0.20 else "flat"
         recent = [v for _, v in pts[-24:]]
         return {
             "y10": round(y10, 2),
