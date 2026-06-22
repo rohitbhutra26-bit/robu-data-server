@@ -1500,6 +1500,8 @@ def company(symbol: str):
     else:
         resolved_exchange = exchange  # from _resolve_ticker
 
+    _pb_val = safe_val(rv(ks, "priceToBook"))  # Yahoo P/B → also used to derive book value/share
+
     result = {
         "symbol": symbol,
         "name": rv(pr, "longName") or rv(pr, "shortName") or stock_meta.get("name", symbol),
@@ -1517,7 +1519,8 @@ def company(symbol: str):
         "marketCap": mktcap_cr,
         "pe": safe_val(rv(sd, "trailingPE")),
         "forwardPE": safe_val(rv(sd, "forwardPE")),
-        "pb": safe_val(rv(ks, "priceToBook")),
+        "pb": _pb_val,
+        "bookValue": round(price_val / _pb_val, 2) if _pb_val and _pb_val > 0 and price_val and price_val > 0 else 0.0,
         "roe": round(float(roe_raw) * 100, 2) if roe_raw else 0.0,
         "roa": round(float(roa_raw) * 100, 2) if roa_raw else 0.0,
         "eps": safe_val(rv(ks, "trailingEps")),
@@ -1728,7 +1731,10 @@ def company_v2(symbol: str):
         # NSE stocks (or BSE with no bhavcopy yet): Yahoo Finance gives full
         # fundamentals, then NSE/BSE Bhavcopy as a last-resort price-only record.
         try:
-            return company(symbol)   # v1 Yahoo Finance path (handles its own caching)
+            _res = company(symbol)   # v1 Yahoo Finance path (handles its own caching)
+            if isinstance(_res, dict) and not _res.get("bookValue") and (_res.get("pb") or 0) > 0 and (_res.get("currentPrice") or 0) > 0:
+                _res["bookValue"] = round(_res["currentPrice"] / _res["pb"], 2)
+            return _res
         except Exception as yf_err:
             print(f"[company-v2] Yahoo also failed for {symbol}: {yf_err}")
             bhav = _bhavcopy_price(symbol) or _bse_bhavcopy_price(symbol)

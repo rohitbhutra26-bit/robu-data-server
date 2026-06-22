@@ -9,3 +9,5 @@ __pycache__
 discovery_data/
 *.db
 __pycache__/
+
+.DS_Store
