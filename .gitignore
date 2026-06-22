@@ -11,3 +11,4 @@ discovery_data/
 __pycache__/
 
 .DS_Store
+nse_sectors.json

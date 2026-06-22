@@ -872,9 +872,59 @@ def _resolve_ticker(symbol: str) -> tuple[str, str]:
     return initial, "NSE"
 
 
+_NSE_SECTOR_URL = "https://nsearchives.nseindia.com/content/indices/ind_niftytotalmarket_list.csv"
+_NSE_SECTOR_CACHE = os.path.join(os.path.dirname(__file__), "nse_sectors.json")
+
+
+def _load_nse_sectors():
+    """Backfill REAL industry labels onto NSE entries — NSE's EQUITY_L.csv has no
+    sector, so search would otherwise show the 'NSE Listed' placeholder. Source:
+    NSE Nifty Total Market constituents CSV (Industry column), ~750 most-traded
+    names = essentially all search traffic. Same nsearchives domain as the working
+    EQUITY_L download. Cached 24h; graceful no-op on failure (no regression)."""
+    global STOCK_UNIVERSE
+    sectors: dict[str, str] = {}
+    if os.path.exists(_NSE_SECTOR_CACHE):
+        try:
+            c = json.load(open(_NSE_SECTOR_CACHE))
+            if datetime.now() - datetime.fromisoformat(c.get("saved_at", "2000-01-01")) < timedelta(hours=_NSE_CACHE_TTL_HOURS):
+                sectors = c.get("sectors", {})
+        except Exception:
+            pass
+    if not sectors:
+        try:
+            from io import StringIO
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+                "Accept": "text/csv,*/*",
+                "Referer": "https://www.nseindia.com",
+            }
+            resp = requests.get(_NSE_SECTOR_URL, headers=headers, timeout=30)
+            resp.raise_for_status()
+            df = pd.read_csv(StringIO(resp.text))
+            for _, row in df.iterrows():
+                sym = str(row.get("Symbol", "")).strip().upper()
+                ind = str(row.get("Industry", "")).strip()
+                if sym and ind and ind.lower() != "nan":
+                    sectors[sym] = ind
+            if sectors:
+                json.dump({"saved_at": datetime.now().isoformat(), "sectors": sectors}, open(_NSE_SECTOR_CACHE, "w"))
+        except Exception as e:
+            print(f"[ROBU] NSE sector enrich failed: {e} — search keeps 'NSE Listed' placeholder")
+            return
+    applied = 0
+    for sym, ind in sectors.items():
+        info = STOCK_UNIVERSE.get(sym)
+        if info and (info.get("sector") in ("NSE Listed", "", "Unknown", None)):
+            info["sector"] = ind
+            applied += 1
+    print(f"[ROBU] Applied {applied} NSE industry labels to search universe.")
+
+
 # Load universe on startup
 _load_nse_universe()
 _load_bse_universe()
+_load_nse_sectors()
 
 
 # ---------------------------------------------------------------------------
