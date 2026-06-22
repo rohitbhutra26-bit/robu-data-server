@@ -728,8 +728,13 @@ def _merge_bse_records(records: list[dict]) -> int:
         sid    = str(rec.get("sid", "") or "").strip().upper()
         if not code or not name:
             continue
-        # Already in NSE universe (matched by ISIN) — skip, NSE is primary
+        # Already in NSE universe (matched by ISIN) — NSE stays primary, but copy
+        # the BSE industry onto the NSE entry: NSE's EQUITY_L.csv has no sector, so
+        # otherwise search shows the "NSE Listed" placeholder for dual-listed names.
         if isin and isin in isin_to_nse:
+            nse_sym = isin_to_nse[isin]
+            if sector and sector != "BSE Listed" and STOCK_UNIVERSE.get(nse_sym, {}).get("sector") in ("NSE Listed", "", None):
+                STOCK_UNIVERSE[nse_sym]["sector"] = sector
             continue
         # BSE-only stock — prefer the alphanumeric scrip_id (searchable,
         # Screener-compatible), fall back to numeric code
@@ -1871,6 +1876,11 @@ def company_v2(symbol: str):
             description = (_ap.get("longBusinessSummary") or "").strip()
     except Exception as _e:
         print(f"[company-v2] assetProfile enrich skipped for {symbol}: {_e}")
+
+    # Progressive search enrichment — remember the real sector so the /search
+    # dropdown stops showing the "NSE Listed" placeholder for this stock next time.
+    if sector and sector not in ("Unknown", "NSE Listed", "BSE Listed") and symbol in STOCK_UNIVERSE:
+        STOCK_UNIVERSE[symbol]["sector"] = sector
 
     result = {
         "symbol":         symbol,
