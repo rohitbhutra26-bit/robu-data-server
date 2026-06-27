@@ -591,6 +591,28 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+# ── Cache-Control: let the browser/CDN serve repeat GETs instantly (stale-while-
+# revalidate) so re-opening or refreshing a stock doesn't re-pay the scrape latency.
+# Prices stay near-fresh (30s); fundamentals 5 min; both serve-stale while revalidating.
+@app.middleware("http")
+async def add_cache_headers(request, call_next):
+    resp = await call_next(request)
+    try:
+        if request.method == "GET" and resp.status_code == 200:
+            path = request.url.path
+            if path.startswith("/price") or path.startswith("/ohlc"):
+                resp.headers["Cache-Control"] = "public, max-age=30, stale-while-revalidate=90"
+            elif any(path.startswith(pfx) for pfx in (
+                "/company", "/financials", "/peers", "/quarterly", "/dividends",
+                "/shareholding", "/analyst", "/historical", "/announcements",
+                "/macro", "/forecast", "/search",
+            )):
+                resp.headers["Cache-Control"] = "public, max-age=300, stale-while-revalidate=900"
+    except Exception:
+        pass
+    return resp
+
 # ---------------------------------------------------------------------------
 # NSE Full Universe — downloaded from NSE on startup, cached locally 24h
 # ---------------------------------------------------------------------------
