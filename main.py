@@ -552,7 +552,10 @@ def _parse_screener_financials(soup: Any) -> list:
     borrow_vals  = _row(bs_rows, "borrowings", "total debt")
     eqcap_vals   = _row(bs_rows, "equity capital", "equity share capital", "share capital")
     reserve_vals = _row(bs_rows, "reserves")
+    ta_vals      = _row(bs_rows, "total assets", "total liabilities")  # Screener: assets=liabilities total
     bs_borrow = {y: (borrow_vals[i] if i < len(borrow_vals) else 0.0) for i, y in enumerate(bs_years)}
+    bs_ta       = {y: (ta_vals[i] if i < len(ta_vals) else 0.0) for i, y in enumerate(bs_years)}
+    bs_reserves = {y: (reserve_vals[i] if i < len(reserve_vals) else 0.0) for i, y in enumerate(bs_years)}
     bs_equity = {
         y: (eqcap_vals[i] if i < len(eqcap_vals) else 0.0)
            + (reserve_vals[i] if i < len(reserve_vals) else 0.0)
@@ -592,6 +595,8 @@ def _parse_screener_financials(soup: Any) -> list:
             "interest":      round(intr, 2),   # Interest expense — for coverage ratio
             "borrowings":    round(bs_borrow.get(yr, 0.0), 2),  # Total debt from balance sheet
             "equity":        round(bs_equity.get(yr, 0.0), 2),  # Equity capital + reserves
+            "totalAssets":   round(bs_ta.get(yr, 0.0), 2),      # Total assets (= total liabilities) for ROA/Altman
+            "reserves":      round(bs_reserves.get(yr, 0.0), 2),# Retained earnings proxy for Altman X2
             "source":        "screener",
         })
 
