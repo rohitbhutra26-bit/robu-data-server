@@ -12,6 +12,7 @@ from fastapi.responses import RedirectResponse, HTMLResponse
 import pandas as pd
 import numpy as np
 import time
+import threading
 import os
 import json
 import requests
@@ -56,8 +57,13 @@ import difflib as _difflib
 SCREENER_USERNAME = os.environ.get("SCREENER_USERNAME", "")
 SCREENER_PASSWORD = os.environ.get("SCREENER_PASSWORD", "")
 
-_screener_session: Any = None          # requests.Session kept alive
-_screener_session_at: float = 0        # unix timestamp when session was created
+# Per-THREAD Screener session. FastAPI runs sync endpoints in a threadpool, and
+# requests.Session is NOT thread-safe — a single shared session let concurrent
+# requests interleave and read each other's HTTP responses, so one stock's page got
+# parsed+cached under another stock's symbol (the wrong-company bug). threading.local
+# gives every worker thread its own authenticated session: concurrency preserved,
+# race eliminated. Each thread logs in once and reuses for 18h.
+_screener_local = threading.local()
 _SCREENER_SESSION_TTL = 18 * 3600      # reauth every 18 hours
 
 
@@ -80,14 +86,14 @@ def _get_screener_session():
     Return an authenticated requests.Session for Screener.in.
     Logs in once, caches session for 18 hours. Returns None if no credentials.
     """
-    global _screener_session, _screener_session_at
-
     if not SCREENER_USERNAME or not SCREENER_PASSWORD:
         return None  # No creds → caller uses public page scraping
 
-    # Return cached session if still fresh
-    if _screener_session and (time.time() - _screener_session_at) < _SCREENER_SESSION_TTL:
-        return _screener_session
+    # Return this thread's cached session if still fresh
+    _sess = getattr(_screener_local, "session", None)
+    _at   = getattr(_screener_local, "session_at", 0.0)
+    if _sess and (time.time() - _at) < _SCREENER_SESSION_TTL:
+        return _sess
 
     try:
         sess = requests.Session()
@@ -122,9 +128,9 @@ def _get_screener_session():
 
         # Login succeeded if we're no longer on the login page
         if resp.status_code == 200 and "/login" not in resp.url:
-            _screener_session = sess
-            _screener_session_at = time.time()
-            print(f"[Screener] Authenticated as {SCREENER_USERNAME}")
+            _screener_local.session = sess
+            _screener_local.session_at = time.time()
+            print(f"[Screener] Authenticated as {SCREENER_USERNAME} (thread {threading.get_ident()})")
             return sess
         else:
             print(f"[Screener] Login failed — status {resp.status_code}, url {resp.url}")
@@ -182,6 +188,18 @@ def _fetch_screener_page(symbol: str) -> Any:
                         continue
                     soup = BeautifulSoup(resp.text, "lxml")
                     if soup.find(id="top-ratios") or soup.find(id="profit-loss"):
+                        # Guard: confirm the page is actually the requested company, so a
+                        # mis-fetch can never be parsed+cached under the wrong symbol.
+                        _h1 = soup.find("h1")
+                        _pname = _h1.get_text(strip=True) if _h1 else ""
+                        _expected = STOCK_UNIVERSE.get(symbol, {}).get("name", "")
+                        if _pname and _expected:
+                            _STOP = {"ltd","limited","india","industries","company","corporation","the","and"}
+                            _a = {w for w in re.findall(r"[a-z]{3,}", _pname.lower()) if w not in _STOP}
+                            _b = {w for w in re.findall(r"[a-z]{3,}", _expected.lower()) if w not in _STOP}
+                            if _a and _b and not (_a & _b):
+                                print(f"[Screener] {symbol}: page is '{_pname}' not '{_expected}' — discarding (mismatch guard)")
+                                return None
                         print(f"[Screener] {symbol}→{sym_candidate}: loaded {variant or 'standalone'} page ✓")
                         return soup
                 except Exception as e:
