@@ -13,6 +13,7 @@ import pandas as pd
 import numpy as np
 import time
 import threading
+import functools
 import os
 import json
 import requests
@@ -994,6 +995,38 @@ def _cache_set(key: str, data: Any) -> None:
     _cache[key] = (data, time.time())
 
 
+# ── Resilience: never-expiring "last good" payload per endpoint. When the live
+# fetch fails or returns junk, serve the last successful answer (flagged stale)
+# instead of a 404/blank screen. Pure cache — no extra data source.
+_lastgood: dict[str, tuple[Any, float]] = {}
+
+def _resilient(fn):
+    @functools.wraps(fn)
+    def wrapper(symbol, *args, **kwargs):
+        key = f"{fn.__name__}:{str(symbol).upper()}"
+        def _stale(entry):
+            data, ts = entry
+            if isinstance(data, dict):
+                return {**data, "stale": True, "asOf": int(ts)}
+            return data  # lists can't carry a flag; serve last-good as-is
+        try:
+            res = fn(symbol, *args, **kwargs)
+            ok = (isinstance(res, dict) and (res.get("currentPrice") or 0) > 0) \
+                 or (isinstance(res, list) and len(res) >= 3)
+            if ok:
+                _lastgood[key] = (res, time.time())
+                return res
+            lg = _lastgood.get(key)
+            return _stale(lg) if lg else res
+        except Exception:
+            lg = _lastgood.get(key)
+            if lg:
+                print(f"[resilient] {key}: live fetch failed — serving last-good")
+                return _stale(lg)
+            raise
+    return wrapper
+
+
 # ---------------------------------------------------------------------------
 # NSE Bhavcopy — official end-of-day price feed (free, no auth needed)
 # ---------------------------------------------------------------------------
@@ -1781,6 +1814,7 @@ def financials(symbol: str):
 
 
 @app.get("/company-v2/{symbol}")
+@_resilient
 def company_v2(symbol: str):
     """
     Company fundamentals — Screener.in + NSE Bhavcopy. No Yahoo Finance.
@@ -2019,6 +2053,7 @@ def company_v2(symbol: str):
 
 
 @app.get("/financials-v2/{symbol}")
+@_resilient
 def financials_v2(symbol: str):
     """
     Financials from Screener.in (BeautifulSoup parsed) — revenue always in ₹ Crore.
