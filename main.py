@@ -973,6 +973,26 @@ _load_bse_universe()
 _load_nse_sectors()
 
 
+# Gentle one-time pre-warm of the most-opened stocks shortly after boot, so they're
+# instant for the first users and have a last-good snapshot for resilience. One pass,
+# spaced out — not a continuous loop, to stay light on Screener. (Free, no Yahoo.)
+_WARM_SYMBOLS = ["RELIANCE","TCS","INFY","HDFCBANK","ICICIBANK","SBIN","ITC",
+                 "BHARTIARTL","LT","HINDUNILVR","BAJFINANCE","TATAMOTORS","TITAN","MARUTI"]
+def _prewarm_once():
+    time.sleep(25)  # let the server finish booting + universe load
+    for _sym in _WARM_SYMBOLS:
+        try:
+            company_v2(_sym); financials_v2(_sym)
+        except Exception as _e:
+            print(f"[prewarm] {_sym}: {_e}")
+        time.sleep(4)  # gentle pacing
+    print("[prewarm] popular stocks warmed")
+try:
+    threading.Thread(target=_prewarm_once, daemon=True, name="prewarm").start()
+except Exception as _e:
+    print(f"[prewarm] not started: {_e}")
+
+
 # ---------------------------------------------------------------------------
 # Simple TTL cache — {key: (data, timestamp)}
 # ---------------------------------------------------------------------------
@@ -1828,7 +1848,7 @@ def company_v2(symbol: str):
     symbol = symbol.upper().strip()
     symbol = _SYMBOL_REDIRECTS.get(symbol, symbol)   # handle demergers/renames
     cache_key = f"company_v2:{symbol}"
-    cached = _cache_get(cache_key)
+    cached = _cache_get(cache_key, ttl=3600)   # 1h — fundamentals + EOD price barely change intraday
     if cached is not None:
         return cached
 
@@ -2063,7 +2083,7 @@ def financials_v2(symbol: str):
     symbol = symbol.upper().strip()
     symbol = _SYMBOL_REDIRECTS.get(symbol, symbol)   # handle demergers/renames
     cache_key = f"financials_v2:{symbol}"
-    cached = _cache_get(cache_key)
+    cached = _cache_get(cache_key, ttl=21600)   # 6h — quarterly data
     if cached is not None:
         return cached
 
